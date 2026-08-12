@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.git
+inf/
+upload_bots/
+*.db
+*.sqlite
+*.sqlite3
+Dockerfile
+.dockerignore
+railway.json
+README.md
+.gitignore
