@@ -1,2222 +1,2747 @@
-# -*- coding: utf-8 -*-
-import telebot
-import subprocess
-import os
-import zipfile
-import tempfile
-import shutil
-from telebot import types
-import time
-from datetime import datetime, timedelta
-# Removed unused telegram.* imports as we are using telebot consistently
-# from telegram import Update
-# from telegram.ext import Updater, CommandHandler, CallbackContext
-# import psutil
-import sqlite3
-import json # Kept in case needed elsewhere, but not used in provided logic
-import logging # Kept in case needed elsewhere
-import signal # Kept in case needed elsewhere
-import threading
-import re # Added for regex matching in auto-install
-import sys # Added for sys.executable
-import atexit
-import requests # For polling exceptions
-
-# --- Flask Keep Alive ---
-from flask import Flask
-from threading import Thread
-
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "I'am Marco File Host"
-
-def run_flask():
-  # Make sure to run on port provided by environment or default to 8080
-  port = int(os.environ.get("PORT", 8080))
-  app.run(host='0.0.0.0', port=port)
-
-def keep_alive():
-    t = Thread(target=run_flask)
-    t.daemon = True # Allows program to exit even if this thread is running
-    t.start()
-    print("Flask Keep-Alive server started.")
-# --- End Flask Keep Alive ---
-
-# --- Configuration ---
-TOKEN = '8710003468:AAFou6EOMDf0L7tr2cId3K2dwDbR-6AfQXM' # Replace with your actual token
-OWNER_ID = 8438952283 # Replace with your Owner ID
-ADMIN_ID = 8438952283 # Replace with your Admin ID (can be same as Owner)
-YOUR_USERNAME = '@developertineshera' # Replace with your Telegram username (without the @)
-UPDATE_CHANNEL = 't.me/@reversebypass01' # Replace with your update channel link
-
-# Folder setup - using absolute paths
-BASE_DIR = os.path.abspath(os.path.dirname(__file__)) # Get script's directory
-UPLOAD_BOTS_DIR = os.path.join(BASE_DIR, 'upload_bots')
-IROTECH_DIR = os.path.join(BASE_DIR, 'inf') # Assuming this name is intentional
-DATABASE_PATH = os.path.join(IROTECH_DIR, 'bot_data.db')
-
-# File upload limits
-FREE_USER_LIMIT = 10
-SUBSCRIBED_USER_LIMIT = 15 # Changed from 10 to 15
-ADMIN_LIMIT = 999       # Changed from 50 to 999
-OWNER_LIMIT = float('inf') # Changed from 999 to infinity
-# FREE_MODE_LIMIT = 3 # Removed as free_mode is removed
-
-# Create necessary directories
-os.makedirs(UPLOAD_BOTS_DIR, exist_ok=True)
-os.makedirs(IROTECH_DIR, exist_ok=True)
-
-# Initialize bot
-bot = telebot.TeleBot(TOKEN)
-
-# --- Data structures ---
-bot_scripts = {} # Stores info about running scripts {script_key: info_dict}
-user_subscriptions = {} # {user_id: {'expiry': datetime_object}}
-user_files = {} # {user_id: [(file_name, file_type), ...]}
-active_users = set() # Set of all user IDs that have interacted with the bot
-admin_ids = {ADMIN_ID, OWNER_ID} # Set of admin IDs
-bot_locked = False
-# free_mode = False # Removed free_mode
-
-# --- Logging Setup ---
-# Configure basic logging
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# --- Command Button Layouts (ReplyKeyboardMarkup) ---
-COMMAND_BUTTONS_LAYOUT_USER_SPEC = [
-    ["📢 Updates Channel"],
-    ["📤 Upload File", "📂 Check Files"],
-    ["⚡ Bot Speed", "📊 Statistics"], # Statistics button kept for users, logic will restrict if not admin
-    ["📞 Contact Owner"]
-]
-ADMIN_COMMAND_BUTTONS_LAYOUT_USER_SPEC = [
-    ["📢 Updates Channel"],
-    ["📤 Upload File", "📂 Check Files"],
-    ["⚡ Bot Speed", "📊 Statistics"],
-    ["💳 Subscriptions", "📢 Broadcast"],
-    ["🔒 Lock Bot", "🟢 Running All Code"], # Changed "Free Mode" to "Running All Code"
-    ["👑 Admin Panel", "📞 Contact Owner"]
-]
-
-# --- Database Setup ---
-def init_db():
-    """Initialize the database with required tables"""
-    logger.info(f"Initializing database at: {DATABASE_PATH}")
-    try:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False) # Allow access from multiple threads
-        c = conn.cursor()
-        c.execute('''CREATE TABLE IF NOT EXISTS subscriptions
-                     (user_id INTEGER PRIMARY KEY, expiry TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS user_files
-                     (user_id INTEGER, file_name TEXT, file_type TEXT,
-                      PRIMARY KEY (user_id, file_name))''')
-        c.execute('''CREATE TABLE IF NOT EXISTS active_users
-                     (user_id INTEGER PRIMARY KEY)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS admins
-                     (user_id INTEGER PRIMARY KEY)''') # Added admins table
-        # Ensure owner and initial admin are in admins table
-        c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (OWNER_ID,))
-        if ADMIN_ID != OWNER_ID:
-             c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (ADMIN_ID,))
-        conn.commit()
-        conn.close()
-        logger.info("Database initialized successfully.")
-    except Exception as e:
-        logger.error(f"❌ Database initialization error: {e}", exc_info=True)
-
-def load_data():
-    """Load data from database into memory"""
-    logger.info("Loading data from database...")
-    try:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-
-        # Load subscriptions
-        c.execute('SELECT user_id, expiry FROM subscriptions')
-        for user_id, expiry in c.fetchall():
-            try:
-                user_subscriptions[user_id] = {'expiry': datetime.fromisoformat(expiry)}
-            except ValueError:
-                logger.warning(f"⚠️ Invalid expiry date format for user {user_id}: {expiry}. Skipping.")
-
-        # Load user files
-        c.execute('SELECT user_id, file_name, file_type FROM user_files')
-        for user_id, file_name, file_type in c.fetchall():
-            if user_id not in user_files:
-                user_files[user_id] = []
-            user_files[user_id].append((file_name, file_type))
-
-        # Load active users
-        c.execute('SELECT user_id FROM active_users')
-        active_users.update(user_id for (user_id,) in c.fetchall())
-
-        # Load admins
-        c.execute('SELECT user_id FROM admins')
-        admin_ids.update(user_id for (user_id,) in c.fetchall()) # Load admins into the set
-
-        conn.close()
-        logger.info(f"Data loaded: {len(active_users)} users, {len(user_subscriptions)} subscriptions, {len(admin_ids)} admins.")
-    except Exception as e:
-        logger.error(f"❌ Error loading data: {e}", exc_info=True)
-
-# Initialize DB and Load Data at startup
-init_db()
-load_data()
-# --- End Database Setup ---
-
-# --- Helper Functions ---
-def get_user_folder(user_id):
-    """Get or create user's folder for storing files"""
-    user_folder = os.path.join(UPLOAD_BOTS_DIR, str(user_id))
-    os.makedirs(user_folder, exist_ok=True)
-    return user_folder
-
-def get_user_file_limit(user_id):
-    """Get the file upload limit for a user"""
-    # if free_mode: return FREE_MODE_LIMIT # Removed free_mode check
-    if user_id == OWNER_ID: return OWNER_LIMIT
-    if user_id in admin_ids: return ADMIN_LIMIT
-    if user_id in user_subscriptions and user_subscriptions[user_id]['expiry'] > datetime.now():
-        return SUBSCRIBED_USER_LIMIT
-    return FREE_USER_LIMIT
-
-def get_user_file_count(user_id):
-    """Get the number of files uploaded by a user"""
-    return len(user_files.get(user_id, []))
-
-def is_bot_running(script_owner_id, file_name): # Parameter renamed for clarity
-    """Check if a bot script is currently running for a specific user"""
-    script_key = f"{script_owner_id}_{file_name}" # Key uses script_owner_id
-    script_info = bot_scripts.get(script_key)
-    if script_info and script_info.get('process'):
-        try:
-            proc = psutil.Process(script_info['process'].pid)
-            is_running = proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE
-            if not is_running:
-                logger.warning(f"Process {script_info['process'].pid} for {script_key} found in memory but not running/zombie. Cleaning up.")
-                if 'log_file' in script_info and hasattr(script_info['log_file'], 'close') and not script_info['log_file'].closed:
-                    try:
-                        script_info['log_file'].close()
-                    except Exception as log_e:
-                        logger.error(f"Error closing log file during zombie cleanup {script_key}: {log_e}")
-                if script_key in bot_scripts:
-                    del bot_scripts[script_key]
-            return is_running
-        except psutil.NoSuchProcess:
-            logger.warning(f"Process for {script_key} not found (NoSuchProcess). Cleaning up.")
-            if 'log_file' in script_info and hasattr(script_info['log_file'], 'close') and not script_info['log_file'].closed:
-                try:
-                     script_info['log_file'].close()
-                except Exception as log_e:
-                     logger.error(f"Error closing log file during cleanup of non-existent process {script_key}: {log_e}")
-            if script_key in bot_scripts:
-                 del bot_scripts[script_key]
-            return False
-        except Exception as e:
-            logger.error(f"Error checking process status for {script_key}: {e}", exc_info=True)
-            return False
-    return False
-
-
-def kill_process_tree(process_info):
-    """Kill a process and all its children, ensuring log file is closed."""
-    pid = None
-    log_file_closed = False
-    script_key = process_info.get('script_key', 'N/A') 
-
-    try:
-        if 'log_file' in process_info and hasattr(process_info['log_file'], 'close') and not process_info['log_file'].closed:
-            try:
-                process_info['log_file'].close()
-                log_file_closed = True
-                logger.info(f"Closed log file for {script_key} (PID: {process_info.get('process', {}).get('pid', 'N/A')})")
-            except Exception as log_e:
-                logger.error(f"Error closing log file during kill for {script_key}: {log_e}")
-
-        process = process_info.get('process')
-        if process and hasattr(process, 'pid'):
-           pid = process.pid
-           if pid: 
-                try:
-                    parent = psutil.Process(pid)
-                    children = parent.children(recursive=True)
-                    logger.info(f"Attempting to kill process tree for {script_key} (PID: {pid}, Children: {[c.pid for c in children]})")
-
-                    for child in children:
-                        try:
-                            child.terminate()
-                            logger.info(f"Terminated child process {child.pid} for {script_key}")
-                        except psutil.NoSuchProcess:
-                            logger.warning(f"Child process {child.pid} for {script_key} already gone.")
-                        except Exception as e:
-                            logger.error(f"Error terminating child {child.pid} for {script_key}: {e}. Trying kill...")
-                            try: child.kill(); logger.info(f"Killed child process {child.pid} for {script_key}")
-                            except Exception as e2: logger.error(f"Failed to kill child {child.pid} for {script_key}: {e2}")
-
-                    gone, alive = psutil.wait_procs(children, timeout=1)
-                    for p in alive:
-                        logger.warning(f"Child process {p.pid} for {script_key} still alive. Killing.")
-                        try: p.kill()
-                        except Exception as e: logger.error(f"Failed to kill child {p.pid} for {script_key} after wait: {e}")
-
-                    try:
-                        parent.terminate()
-                        logger.info(f"Terminated parent process {pid} for {script_key}")
-                        try: parent.wait(timeout=1)
-                        except psutil.TimeoutExpired:
-                            logger.warning(f"Parent process {pid} for {script_key} did not terminate. Killing.")
-                            parent.kill()
-                            logger.info(f"Killed parent process {pid} for {script_key}")
-                    except psutil.NoSuchProcess:
-                        logger.warning(f"Parent process {pid} for {script_key} already gone.")
-                    except Exception as e:
-                        logger.error(f"Error terminating parent {pid} for {script_key}: {e}. Trying kill...")
-                        try: parent.kill(); logger.info(f"Killed parent process {pid} for {script_key}")
-                        except Exception as e2: logger.error(f"Failed to kill parent {pid} for {script_key}: {e2}")
-
-                except psutil.NoSuchProcess:
-                    logger.warning(f"Process {pid or 'N/A'} for {script_key} not found during kill. Already terminated?")
-           else: logger.error(f"Process PID is None for {script_key}.")
-        elif log_file_closed: logger.warning(f"Process object missing for {script_key}, but log file closed.")
-        else: logger.error(f"Process object missing for {script_key}, and no log file. Cannot kill.")
-    except Exception as e:
-        logger.error(f"❌ Unexpected error killing process tree for PID {pid or 'N/A'} ({script_key}): {e}", exc_info=True)
-
-# --- Automatic Package Installation & Script Running ---
-
-def attempt_install_pip(module_name, message):
-    package_name = TELEGRAM_MODULES.get(module_name.lower(), module_name) 
-    if package_name is None: 
-        logger.info(f"Module '{module_name}' is core. Skipping pip install.")
-        return False 
-    try:
-        bot.reply_to(message, f"🐍 Module `{module_name}` not found. Installing `{package_name}`...", parse_mode='Markdown')
-        command = [sys.executable, '-m', 'pip', 'install', package_name]
-        logger.info(f"Running install: {' '.join(command)}")
-        result = subprocess.run(command, capture_output=True, text=True, check=False, encoding='utf-8', errors='ignore')
-        if result.returncode == 0:
-            logger.info(f"Installed {package_name}. Output:\n{result.stdout}")
-            bot.reply_to(message, f"✅ Package `{package_name}` (for `{module_name}`) installed.", parse_mode='Markdown')
-            return True
-        else:
-            error_msg = f"❌ Failed to install `{package_name}` for `{module_name}`.\nLog:\n```\n{result.stderr or result.stdout}\n```"
-            logger.error(error_msg)
-            if len(error_msg) > 4000: error_msg = error_msg[:4000] + "\n... (Log truncated)"
-            bot.reply_to(message, error_msg, parse_mode='Markdown')
-            return False
-    except Exception as e:
-        error_msg = f"❌ Error installing `{package_name}`: {str(e)}"
-        logger.error(error_msg, exc_info=True)
-        bot.reply_to(message, error_msg)
-        return False
-
-def attempt_install_npm(module_name, user_folder, message):
-    try:
-        bot.reply_to(message, f"🟠 Node package `{module_name}` not found. Installing locally...", parse_mode='Markdown')
-        command = ['npm', 'install', module_name]
-        logger.info(f"Running npm install: {' '.join(command)} in {user_folder}")
-        result = subprocess.run(command, capture_output=True, text=True, check=False, cwd=user_folder, encoding='utf-8', errors='ignore')
-        if result.returncode == 0:
-            logger.info(f"Installed {module_name}. Output:\n{result.stdout}")
-            bot.reply_to(message, f"✅ Node package `{module_name}` installed locally.", parse_mode='Markdown')
-            return True
-        else:
-            error_msg = f"❌ Failed to install Node package `{module_name}`.\nLog:\n```\n{result.stderr or result.stdout}\n```"
-            logger.error(error_msg)
-            if len(error_msg) > 4000: error_msg = error_msg[:4000] + "\n... (Log truncated)"
-            bot.reply_to(message, error_msg, parse_mode='Markdown')
-            return False
-    except FileNotFoundError:
-         error_msg = "❌ Error: 'npm' not found. Ensure Node.js/npm are installed and in PATH."
-         logger.error(error_msg)
-         bot.reply_to(message, error_msg)
-         return False
-    except Exception as e:
-        error_msg = f"❌ Error installing Node package `{module_name}`: {str(e)}"
-        logger.error(error_msg, exc_info=True)
-        bot.reply_to(message, error_msg)
-        return False
-
-def run_script(script_path, script_owner_id, user_folder, file_name, message_obj_for_reply, attempt=1):
-    """Run Python script. script_owner_id is used for the script_key. message_obj_for_reply is for sending feedback."""
-    max_attempts = 2 
-    if attempt > max_attempts:
-        bot.reply_to(message_obj_for_reply, f"❌ Failed to run '{file_name}' after {max_attempts} attempts. Check logs.")
-        return
-
-    script_key = f"{script_owner_id}_{file_name}"
-    logger.info(f"Attempt {attempt} to run Python script: {script_path} (Key: {script_key}) for user {script_owner_id}")
-
-    try:
-        if not os.path.exists(script_path):
-             bot.reply_to(message_obj_for_reply, f"❌ Error: Script '{file_name}' not found at '{script_path}'!")
-             logger.error(f"Script not found: {script_path} for user {script_owner_id}")
-             if script_owner_id in user_files:
-                 user_files[script_owner_id] = [f for f in user_files.get(script_owner_id, []) if f[0] != file_name]
-             remove_user_file_db(script_owner_id, file_name)
-             return
-
-        if attempt == 1:
-            check_command = [sys.executable, script_path]
-            logger.info(f"Running Python pre-check: {' '.join(check_command)}")
-            check_proc = None
-            try:
-                check_proc = subprocess.Popen(check_command, cwd=user_folder, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='ignore')
-                stdout, stderr = check_proc.communicate(timeout=5)
-                return_code = check_proc.returncode
-                logger.info(f"Python Pre-check early. RC: {return_code}. Stderr: {stderr[:200]}...")
-                if return_code != 0 and stderr:
-                    match_py = re.search(r"ModuleNotFoundError: No module named '(.+?)'", stderr)
-                    if match_py:
-                        module_name = match_py.group(1).strip().strip("'\"")
-                        logger.info(f"Detected missing Python module: {module_name}")
-                        if attempt_install_pip(module_name, message_obj_for_reply):
-                            logger.info(f"Install OK for {module_name}. Retrying run_script...")
-                            bot.reply_to(message_obj_for_reply, f"🔄 Install successful. Retrying '{file_name}'...")
-                            time.sleep(2)
-                            threading.Thread(target=run_script, args=(script_path, script_owner_id, user_folder, file_name, message_obj_for_reply, attempt + 1)).start()
-                            return
-                        else:
-                            bot.reply_to(message_obj_for_reply, f"❌ Install failed. Cannot run '{file_name}'.")
-                            return
-                    else:
-                         error_summary = stderr[:500]
-                         bot.reply_to(message_obj_for_reply, f"❌ Error in script pre-check for '{file_name}':\n```\n{error_summary}\n```\nFix the script.", parse_mode='Markdown')
-                         return
-            except subprocess.TimeoutExpired:
-                logger.info("Python Pre-check timed out (>5s), imports likely OK. Killing check process.")
-                if check_proc and check_proc.poll() is None: check_proc.kill(); check_proc.communicate()
-                logger.info("Python Check process killed. Proceeding to long run.")
-            except FileNotFoundError:
-                 logger.error(f"Python interpreter not found: {sys.executable}")
-                 bot.reply_to(message_obj_for_reply, f"❌ Error: Python interpreter '{sys.executable}' not found.")
-                 return
-            except Exception as e:
-                 logger.error(f"Error in Python pre-check for {script_key}: {e}", exc_info=True)
-                 bot.reply_to(message_obj_for_reply, f"❌ Unexpected error in script pre-check for '{file_name}': {e}")
-                 return
-            finally:
-                 if check_proc and check_proc.poll() is None:
-                     logger.warning(f"Python Check process {check_proc.pid} still running. Killing.")
-                     check_proc.kill(); check_proc.communicate()
-
-        logger.info(f"Starting long-running Python process for {script_key}")
-        log_file_path = os.path.join(user_folder, f"{os.path.splitext(file_name)[0]}.log")
-        log_file = None; process = None
-        try: log_file = open(log_file_path, 'w', encoding='utf-8', errors='ignore')
-        except Exception as e:
-             logger.error(f"Failed to open log file '{log_file_path}' for {script_key}: {e}", exc_info=True)
-             bot.reply_to(message_obj_for_reply, f"❌ Failed to open log file '{log_file_path}': {e}")
-             return
-        try:
-            startupinfo = None; creationflags = 0
-            if os.name == 'nt':
-                 startupinfo = subprocess.STARTUPINFO(); startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                 startupinfo.wShowWindow = subprocess.SW_HIDE
-            process = subprocess.Popen(
-                [sys.executable, script_path], cwd=user_folder, stdout=log_file, stderr=log_file,
-                stdin=subprocess.PIPE, startupinfo=startupinfo, creationflags=creationflags,
-                encoding='utf-8', errors='ignore'
-            )
-            logger.info(f"Started Python process {process.pid} for {script_key}")
-            bot_scripts[script_key] = {
-                'process': process, 'log_file': log_file, 'file_name': file_name,
-                'chat_id': message_obj_for_reply.chat.id, # Chat ID for potential future direct replies from script, defaults to admin/triggering user
-                'script_owner_id': script_owner_id, # Actual owner of the script
-                'start_time': datetime.now(), 'user_folder': user_folder, 'type': 'py', 'script_key': script_key
-            }
-            bot.reply_to(message_obj_for_reply, f"✅ Python script '{file_name}' started! (PID: {process.pid}) (For User: {script_owner_id})")
-        except FileNotFoundError:
-             logger.error(f"Python interpreter {sys.executable} not found for long run {script_key}")
-             bot.reply_to(message_obj_for_reply, f"❌ Error: Python interpreter '{sys.executable}' not found.")
-             if log_file and not log_file.closed: log_file.close()
-             if script_key in bot_scripts: del bot_scripts[script_key]
-        except Exception as e:
-            if log_file and not log_file.closed: log_file.close()
-            error_msg = f"❌ Error starting Python script '{file_name}': {str(e)}"
-            logger.error(error_msg, exc_info=True)
-            bot.reply_to(message_obj_for_reply, error_msg)
-            if process and process.poll() is None:
-                 logger.warning(f"Killing potentially started Python process {process.pid} for {script_key}")
-                 kill_process_tree({'process': process, 'log_file': log_file, 'script_key': script_key})
-            if script_key in bot_scripts: del bot_scripts[script_key]
-    except Exception as e:
-        error_msg = f"❌ Unexpected error running Python script '{file_name}': {str(e)}"
-        logger.error(error_msg, exc_info=True)
-        bot.reply_to(message_obj_for_reply, error_msg)
-        if script_key in bot_scripts:
-             logger.warning(f"Cleaning up {script_key} due to error in run_script.")
-             kill_process_tree(bot_scripts[script_key])
-             del bot_scripts[script_key]
-
-def run_js_script(script_path, script_owner_id, user_folder, file_name, message_obj_for_reply, attempt=1):
-    """Run JS script. script_owner_id is used for the script_key. message_obj_for_reply is for sending feedback."""
-    max_attempts = 2
-    if attempt > max_attempts:
-        bot.reply_to(message_obj_for_reply, f"❌ Failed to run '{file_name}' after {max_attempts} attempts. Check logs.")
-        return
-
-    script_key = f"{script_owner_id}_{file_name}"
-    logger.info(f"Attempt {attempt} to run JS script: {script_path} (Key: {script_key}) for user {script_owner_id}")
-
-    try:
-        if not os.path.exists(script_path):
-             bot.reply_to(message_obj_for_reply, f"❌ Error: Script '{file_name}' not found at '{script_path}'!")
-             logger.error(f"JS Script not found: {script_path} for user {script_owner_id}")
-             if script_owner_id in user_files:
-                 user_files[script_owner_id] = [f for f in user_files.get(script_owner_id, []) if f[0] != file_name]
-             remove_user_file_db(script_owner_id, file_name)
-             return
-
-        if attempt == 1:
-            check_command = ['node', script_path]
-            logger.info(f"Running JS pre-check: {' '.join(check_command)}")
-            check_proc = None
-            try:
-                check_proc = subprocess.Popen(check_command, cwd=user_folder, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8', errors='ignore')
-                stdout, stderr = check_proc.communicate(timeout=5)
-                return_code = check_proc.returncode
-                logger.info(f"JS Pre-check early. RC: {return_code}. Stderr: {stderr[:200]}...")
-                if return_code != 0 and stderr:
-                    match_js = re.search(r"Cannot find module '(.+?)'", stderr)
-                    if match_js:
-                        module_name = match_js.group(1).strip().strip("'\"")
-                        if not module_name.startswith('.') and not module_name.startswith('/'):
-                             logger.info(f"Detected missing Node module: {module_name}")
-                             if attempt_install_npm(module_name, user_folder, message_obj_for_reply):
-                                 logger.info(f"NPM Install OK for {module_name}. Retrying run_js_script...")
-                                 bot.reply_to(message_obj_for_reply, f"🔄 NPM Install successful. Retrying '{file_name}'...")
-                                 time.sleep(2)
-                                 threading.Thread(target=run_js_script, args=(script_path, script_owner_id, user_folder, file_name, message_obj_for_reply, attempt + 1)).start()
-                                 return
-                             else:
-                                 bot.reply_to(message_obj_for_reply, f"❌ NPM Install failed. Cannot run '{file_name}'.")
-                                 return
-                        else: logger.info(f"Skipping npm install for relative/core: {module_name}")
-                    error_summary = stderr[:500]
-                    bot.reply_to(message_obj_for_reply, f"❌ Error in JS script pre-check for '{file_name}':\n```\n{error_summary}\n```\nFix script or install manually.", parse_mode='Markdown')
-                    return
-            except subprocess.TimeoutExpired:
-                logger.info("JS Pre-check timed out (>5s), imports likely OK. Killing check process.")
-                if check_proc and check_proc.poll() is None: check_proc.kill(); check_proc.communicate()
-                logger.info("JS Check process killed. Proceeding to long run.")
-            except FileNotFoundError:
-                 error_msg = "❌ Error: 'node' not found. Ensure Node.js is installed for JS files."
-                 logger.error(error_msg)
-                 bot.reply_to(message_obj_for_reply, error_msg)
-                 return
-            except Exception as e:
-                 logger.error(f"Error in JS pre-check for {script_key}: {e}", exc_info=True)
-                 bot.reply_to(message_obj_for_reply, f"❌ Unexpected error in JS pre-check for '{file_name}': {e}")
-                 return
-            finally:
-                 if check_proc and check_proc.poll() is None:
-                     logger.warning(f"JS Check process {check_proc.pid} still running. Killing.")
-                     check_proc.kill(); check_proc.communicate()
-
-        logger.info(f"Starting long-running JS process for {script_key}")
-        log_file_path = os.path.join(user_folder, f"{os.path.splitext(file_name)[0]}.log")
-        log_file = None; process = None
-        try: log_file = open(log_file_path, 'w', encoding='utf-8', errors='ignore')
-        except Exception as e:
-            logger.error(f"Failed to open log file '{log_file_path}' for JS script {script_key}: {e}", exc_info=True)
-            bot.reply_to(message_obj_for_reply, f"❌ Failed to open log file '{log_file_path}': {e}")
-            return
-        try:
-            startupinfo = None; creationflags = 0
-            if os.name == 'nt':
-                 startupinfo = subprocess.STARTUPINFO(); startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                 startupinfo.wShowWindow = subprocess.SW_HIDE
-            process = subprocess.Popen(
-                ['node', script_path], cwd=user_folder, stdout=log_file, stderr=log_file,
-                stdin=subprocess.PIPE, startupinfo=startupinfo, creationflags=creationflags,
-                encoding='utf-8', errors='ignore'
-            )
-            logger.info(f"Started JS process {process.pid} for {script_key}")
-            bot_scripts[script_key] = {
-                'process': process, 'log_file': log_file, 'file_name': file_name,
-                'chat_id': message_obj_for_reply.chat.id, # Chat ID for potential future direct replies
-                'script_owner_id': script_owner_id, # Actual owner of the script
-                'start_time': datetime.now(), 'user_folder': user_folder, 'type': 'js', 'script_key': script_key
-            }
-            bot.reply_to(message_obj_for_reply, f"✅ JS script '{file_name}' started! (PID: {process.pid}) (For User: {script_owner_id})")
-        except FileNotFoundError:
-             error_msg = "❌ Error: 'node' not found for long run. Ensure Node.js is installed."
-             logger.error(error_msg)
-             if log_file and not log_file.closed: log_file.close()
-             bot.reply_to(message_obj_for_reply, error_msg)
-             if script_key in bot_scripts: del bot_scripts[script_key]
-        except Exception as e:
-            if log_file and not log_file.closed: log_file.close()
-            error_msg = f"❌ Error starting JS script '{file_name}': {str(e)}"
-            logger.error(error_msg, exc_info=True)
-            bot.reply_to(message_obj_for_reply, error_msg)
-            if process and process.poll() is None:
-                 logger.warning(f"Killing potentially started JS process {process.pid} for {script_key}")
-                 kill_process_tree({'process': process, 'log_file': log_file, 'script_key': script_key})
-            if script_key in bot_scripts: del bot_scripts[script_key]
-    except Exception as e:
-        error_msg = f"❌ Unexpected error running JS script '{file_name}': {str(e)}"
-        logger.error(error_msg, exc_info=True)
-        bot.reply_to(message_obj_for_reply, error_msg)
-        if script_key in bot_scripts:
-             logger.warning(f"Cleaning up {script_key} due to error in run_js_script.")
-             kill_process_tree(bot_scripts[script_key])
-             del bot_scripts[script_key]
-
-# --- Map Telegram import names to actual PyPI package names ---
-TELEGRAM_MODULES = {
-    # Main Bot Frameworks
-    'telebot': 'pyTelegramBotAPI',
-    'telegram': 'python-telegram-bot',
-    'python_telegram_bot': 'python-telegram-bot',
-    'aiogram': 'aiogram',
-    'pyrogram': 'pyrogram',
-    'telethon': 'telethon',
-    'telethon.sync': 'telethon', # Handle specific imports
-    'from telethon.sync import telegramclient': 'telethon', # Example
-
-    # Additional Libraries (add more specific mappings if import name differs)
-    'telepot': 'telepot',
-    'pytg': 'pytg',
-    'tgcrypto': 'tgcrypto',
-    'telegram_upload': 'telegram-upload',
-    'telegram_send': 'telegram-send',
-    'telegram_text': 'telegram-text',
-
-    # MTProto & Low-Level
-    'mtproto': 'telegram-mtproto', # Example, check actual package name
-    'tl': 'telethon',  # Part of Telethon, install 'telethon'
-
-    # Utilities & Helpers (examples, verify package names)
-    'telegram_utils': 'telegram-utils',
-    'telegram_logger': 'telegram-logger',
-    'telegram_handlers': 'python-telegram-handlers',
-
-    # Database Integrations (examples)
-    'telegram_redis': 'telegram-redis',
-    'telegram_sqlalchemy': 'telegram-sqlalchemy',
-
-    # Payment & E-commerce (examples)
-    'telegram_payment': 'telegram-payment',
-    'telegram_shop': 'telegram-shop-sdk',
-
-    # Testing & Debugging (examples)
-    'pytest_telegram': 'pytest-telegram',
-    'telegram_debug': 'telegram-debug',
-
-    # Scraping & Analytics (examples)
-    'telegram_scraper': 'telegram-scraper',
-    'telegram_analytics': 'telegram-analytics',
-
-    # NLP & AI (examples)
-    'telegram_nlp': 'telegram-nlp-toolkit',
-    'telegram_ai': 'telegram-ai', # Assuming this exists
-
-    # Web & API Integration (examples)
-    'telegram_api': 'telegram-api-client',
-    'telegram_web': 'telegram-web-integration',
-
-    # Gaming & Interactive (examples)
-    'telegram_games': 'telegram-games',
-    'telegram_quiz': 'telegram-quiz-bot',
-
-    # File & Media Handling (examples)
-    'telegram_ffmpeg': 'telegram-ffmpeg',
-    'telegram_media': 'telegram-media-utils',
-
-    # Security & Encryption (examples)
-    'telegram_2fa': 'telegram-twofa',
-    'telegram_crypto': 'telegram-crypto-bot',
-
-    # Localization & i18n (examples)
-    'telegram_i18n': 'telegram-i18n',
-    'telegram_translate': 'telegram-translate',
-
-    # Common non-telegram examples
-    'bs4': 'beautifulsoup4',
-    'requests': 'requests',
-    'pillow': 'Pillow', # Note the capitalization difference
-    'cv2': 'opencv-python', # Common import name for OpenCV
-    'yaml': 'PyYAML',
-    'dotenv': 'python-dotenv',
-    'dateutil': 'python-dateutil',
-    'pandas': 'pandas',
-    'numpy': 'numpy',
-    'flask': 'Flask',
-    'django': 'Django',
-    'sqlalchemy': 'SQLAlchemy',
-    'asyncio': None, # Core module, should not be installed
-    'json': None,    # Core module
-    'datetime': None,# Core module
-    'os': None,      # Core module
-    'sys': None,     # Core module
-    're': None,      # Core module
-    'time': None,    # Core module
-    'math': None,    # Core module
-    'random': None,  # Core module
-    'logging': None, # Core module
-    'threading': None,# Core module
-    'subprocess':None,# Core module
-    'zipfile':None,  # Core module
-    'tempfile':None, # Core module
-    'shutil':None,   # Core module
-    'sqlite3':None,  # Core module
-    'psutil': 'psutil',
-    'atexit': None   # Core module
-
-}
-# --- End Automatic Package Installation & Script Running ---
-
-
-# --- Database Operations ---
-DB_LOCK = threading.Lock() 
-
-def save_user_file(user_id, file_name, file_type='py'):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        try:
-            c.execute('INSERT OR REPLACE INTO user_files (user_id, file_name, file_type) VALUES (?, ?, ?)',
-                      (user_id, file_name, file_type))
-            conn.commit()
-            if user_id not in user_files: user_files[user_id] = []
-            user_files[user_id] = [(fn, ft) for fn, ft in user_files[user_id] if fn != file_name]
-            user_files[user_id].append((file_name, file_type))
-            logger.info(f"Saved file '{file_name}' ({file_type}) for user {user_id}")
-        except sqlite3.Error as e: logger.error(f"❌ SQLite error saving file for user {user_id}, {file_name}: {e}")
-        except Exception as e: logger.error(f"❌ Unexpected error saving file for {user_id}, {file_name}: {e}", exc_info=True)
-        finally: conn.close()
-
-def remove_user_file_db(user_id, file_name):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        try:
-            c.execute('DELETE FROM user_files WHERE user_id = ? AND file_name = ?', (user_id, file_name))
-            conn.commit()
-            if user_id in user_files:
-                user_files[user_id] = [f for f in user_files[user_id] if f[0] != file_name]
-                if not user_files[user_id]: del user_files[user_id]
-            logger.info(f"Removed file '{file_name}' for user {user_id} from DB")
-        except sqlite3.Error as e: logger.error(f"❌ SQLite error removing file for {user_id}, {file_name}: {e}")
-        except Exception as e: logger.error(f"❌ Unexpected error removing file for {user_id}, {file_name}: {e}", exc_info=True)
-        finally: conn.close()
-
-def add_active_user(user_id):
-    active_users.add(user_id) 
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        try:
-            c.execute('INSERT OR IGNORE INTO active_users (user_id) VALUES (?)', (user_id,))
-            conn.commit()
-            logger.info(f"Added/Confirmed active user {user_id} in DB")
-        except sqlite3.Error as e: logger.error(f"❌ SQLite error adding active user {user_id}: {e}")
-        except Exception as e: logger.error(f"❌ Unexpected error adding active user {user_id}: {e}", exc_info=True)
-        finally: conn.close()
-
-def save_subscription(user_id, expiry):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        try:
-            expiry_str = expiry.isoformat()
-            c.execute('INSERT OR REPLACE INTO subscriptions (user_id, expiry) VALUES (?, ?)', (user_id, expiry_str))
-            conn.commit()
-            user_subscriptions[user_id] = {'expiry': expiry}
-            logger.info(f"Saved subscription for {user_id}, expiry {expiry_str}")
-        except sqlite3.Error as e: logger.error(f"❌ SQLite error saving subscription for {user_id}: {e}")
-        except Exception as e: logger.error(f"❌ Unexpected error saving subscription for {user_id}: {e}", exc_info=True)
-        finally: conn.close()
-
-def remove_subscription_db(user_id):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        try:
-            c.execute('DELETE FROM subscriptions WHERE user_id = ?', (user_id,))
-            conn.commit()
-            if user_id in user_subscriptions: del user_subscriptions[user_id]
-            logger.info(f"Removed subscription for {user_id} from DB")
-        except sqlite3.Error as e: logger.error(f"❌ SQLite error removing subscription for {user_id}: {e}")
-        except Exception as e: logger.error(f"❌ Unexpected error removing subscription for {user_id}: {e}", exc_info=True)
-        finally: conn.close()
-
-def add_admin_db(admin_id):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        try:
-            c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (admin_id,))
-            conn.commit()
-            admin_ids.add(admin_id) 
-            logger.info(f"Added admin {admin_id} to DB")
-        except sqlite3.Error as e: logger.error(f"❌ SQLite error adding admin {admin_id}: {e}")
-        except Exception as e: logger.error(f"❌ Unexpected error adding admin {admin_id}: {e}", exc_info=True)
-        finally: conn.close()
-
-def remove_admin_db(admin_id):
-    if admin_id == OWNER_ID:
-        logger.warning("Attempted to remove OWNER_ID from admins.")
-        return False 
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        removed = False
-        try:
-            c.execute('SELECT 1 FROM admins WHERE user_id = ?', (admin_id,))
-            if c.fetchone():
-                c.execute('DELETE FROM admins WHERE user_id = ?', (admin_id,))
-                conn.commit()
-                removed = c.rowcount > 0 
-                if removed: admin_ids.discard(admin_id); logger.info(f"Removed admin {admin_id} from DB")
-                else: logger.warning(f"Admin {admin_id} found but delete affected 0 rows.")
-            else:
-                logger.warning(f"Admin {admin_id} not found in DB.")
-                admin_ids.discard(admin_id)
-            return removed
-        except sqlite3.Error as e: logger.error(f"❌ SQLite error removing admin {admin_id}: {e}"); return False
-        except Exception as e: logger.error(f"❌ Unexpected error removing admin {admin_id}: {e}", exc_info=True); return False
-        finally: conn.close()
-# --- End Database Operations ---
-
-# --- Menu creation (Inline and ReplyKeyboards) ---
-def create_main_menu_inline(user_id):
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    buttons = [
-        types.InlineKeyboardButton('📢 Updates Channel', url=UPDATE_CHANNEL),
-        types.InlineKeyboardButton('📤 Upload File', callback_data='upload'),
-        types.InlineKeyboardButton('📂 Check Files', callback_data='check_files'),
-        types.InlineKeyboardButton('⚡ Bot Speed', callback_data='speed'),
-        types.InlineKeyboardButton('📞 Contact Owner', url=f'https://t.me/{YOUR_USERNAME.replace("@Drax_1z", "")}')
-    ]
-
-    if user_id in admin_ids:
-        admin_buttons = [
-            types.InlineKeyboardButton('💳 Subscriptions', callback_data='subscription'), #0
-            types.InlineKeyboardButton('📊 Statistics', callback_data='stats'), #1
-            types.InlineKeyboardButton('🔒 Lock Bot' if not bot_locked else '🔓 Unlock Bot', #2
-                                     callback_data='lock_bot' if not bot_locked else 'unlock_bot'),
-            types.InlineKeyboardButton('📢 Broadcast', callback_data='broadcast'), #3
-            types.InlineKeyboardButton('👑 Admin Panel', callback_data='admin_panel'), #4
-            types.InlineKeyboardButton('🟢 Run All User Scripts', callback_data='run_all_scripts') #5
-        ]
-        markup.add(buttons[0]) # Updates
-        markup.add(buttons[1], buttons[2]) # Upload, Check Files
-        markup.add(buttons[3], admin_buttons[0]) # Speed, Subscriptions
-        markup.add(admin_buttons[1], admin_buttons[3]) # Stats, Broadcast
-        markup.add(admin_buttons[2], admin_buttons[5]) # Lock Bot, Run All Scripts
-        markup.add(admin_buttons[4]) # Admin Panel
-        markup.add(buttons[4]) # Contact
-    else:
-        markup.add(buttons[0])
-        markup.add(buttons[1], buttons[2])
-        markup.add(buttons[3])
-        markup.add(types.InlineKeyboardButton('📊 Statistics', callback_data='stats')) # Allow non-admins to see stats too
-        markup.add(buttons[4])
-    return markup
-
-def create_reply_keyboard_main_menu(user_id):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    layout_to_use = ADMIN_COMMAND_BUTTONS_LAYOUT_USER_SPEC if user_id in admin_ids else COMMAND_BUTTONS_LAYOUT_USER_SPEC
-    for row_buttons_text in layout_to_use:
-        markup.add(*[types.KeyboardButton(text) for text in row_buttons_text])
-    return markup
-
-def create_control_buttons(script_owner_id, file_name, is_running=True): # Parameter renamed
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    # Callbacks use script_owner_id
-    if is_running:
-        markup.row(
-            types.InlineKeyboardButton("🔴 Stop", callback_data=f'stop_{script_owner_id}_{file_name}'),
-            types.InlineKeyboardButton("🔄 Restart", callback_data=f'restart_{script_owner_id}_{file_name}')
-        )
-        markup.row(
-            types.InlineKeyboardButton("🗑️ Delete", callback_data=f'delete_{script_owner_id}_{file_name}'),
-            types.InlineKeyboardButton("📜 Logs", callback_data=f'logs_{script_owner_id}_{file_name}')
-        )
-    else:
-        markup.row(
-            types.InlineKeyboardButton("🟢 Start", callback_data=f'start_{script_owner_id}_{file_name}'),
-            types.InlineKeyboardButton("🗑️ Delete", callback_data=f'delete_{script_owner_id}_{file_name}')
-        )
-        markup.row(
-            types.InlineKeyboardButton("📜 View Logs", callback_data=f'logs_{script_owner_id}_{file_name}')
-        )
-    markup.add(types.InlineKeyboardButton("🔙 Back to Files", callback_data='check_files'))
-    return markup
-
-def create_admin_panel():
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.row(
-        types.InlineKeyboardButton('➕ Add Admin', callback_data='add_admin'),
-        types.InlineKeyboardButton('➖ Remove Admin', callback_data='remove_admin')
-    )
-    markup.row(types.InlineKeyboardButton('📋 List Admins', callback_data='list_admins'))
-    markup.row(types.InlineKeyboardButton('🔙 Back to Main', callback_data='back_to_main'))
-    return markup
-
-def create_subscription_menu():
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.row(
-        types.InlineKeyboardButton('➕ Add Subscription', callback_data='add_subscription'),
-        types.InlineKeyboardButton('➖ Remove Subscription', callback_data='remove_subscription')
-    )
-    markup.row(types.InlineKeyboardButton('🔍 Check Subscription', callback_data='check_subscription'))
-    markup.row(types.InlineKeyboardButton('🔙 Back to Main', callback_data='back_to_main'))
-    return markup
-# --- End Menu Creation ---
-
-# --- File Handling ---
-def handle_zip_file(downloaded_file_content, file_name_zip, message):
-    user_id = message.from_user.id
-    # chat_id = message.chat.id # script_owner_id (user_id here) will be used for script key context
-    user_folder = get_user_folder(user_id)
-    temp_dir = None 
-    try:
-        temp_dir = tempfile.mkdtemp(prefix=f"user_{user_id}_zip_")
-        logger.info(f"Temp dir for zip: {temp_dir}")
-        zip_path = os.path.join(temp_dir, file_name_zip)
-        with open(zip_path, 'wb') as new_file: new_file.write(downloaded_file_content)
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            for member in zip_ref.infolist():
-                member_path = os.path.abspath(os.path.join(temp_dir, member.filename))
-                if not member_path.startswith(os.path.abspath(temp_dir)):
-                    raise zipfile.BadZipFile(f"Zip has unsafe path: {member.filename}")
-            zip_ref.extractall(temp_dir)
-            logger.info(f"Extracted zip to {temp_dir}")
-
-        extracted_items = os.listdir(temp_dir)
-        py_files = [f for f in extracted_items if f.endswith('.py')]
-        js_files = [f for f in extracted_items if f.endswith('.js')]
-        req_file = 'requirements.txt' if 'requirements.txt' in extracted_items else None
-        pkg_json = 'package.json' if 'package.json' in extracted_items else None
-
-        if req_file:
-            req_path = os.path.join(temp_dir, req_file)
-            logger.info(f"requirements.txt found, installing: {req_path}")
-            bot.reply_to(message, f"🔄 Installing Python deps from `{req_file}`...")
-            try:
-                command = [sys.executable, '-m', 'pip', 'install', '-r', req_path]
-                result = subprocess.run(command, capture_output=True, text=True, check=True, encoding='utf-8', errors='ignore')
-                logger.info(f"pip install from requirements.txt OK. Output:\n{result.stdout}")
-                bot.reply_to(message, f"✅ Python deps from `{req_file}` installed.")
-            except subprocess.CalledProcessError as e:
-                error_msg = f"❌ Failed to install Python deps from `{req_file}`.\nLog:\n```\n{e.stderr or e.stdout}\n```"
-                logger.error(error_msg)
-                if len(error_msg) > 4000: error_msg = error_msg[:4000] + "\n... (Log truncated)"
-                bot.reply_to(message, error_msg, parse_mode='Markdown'); return
-            except Exception as e:
-                 error_msg = f"❌ Unexpected error installing Python deps: {e}"
-                 logger.error(error_msg, exc_info=True); bot.reply_to(message, error_msg); return
-
-        if pkg_json:
-            logger.info(f"package.json found, npm install in: {temp_dir}")
-            bot.reply_to(message, f"🔄 Installing Node deps from `{pkg_json}`...")
-            try:
-                command = ['npm', 'install']
-                result = subprocess.run(command, capture_output=True, text=True, check=True, cwd=temp_dir, encoding='utf-8', errors='ignore')
-                logger.info(f"npm install OK. Output:\n{result.stdout}")
-                bot.reply_to(message, f"✅ Node deps from `{pkg_json}` installed.")
-            except FileNotFoundError:
-                bot.reply_to(message, "❌ 'npm' not found. Cannot install Node deps."); return 
-            except subprocess.CalledProcessError as e:
-                error_msg = f"❌ Failed to install Node deps from `{pkg_json}`.\nLog:\n```\n{e.stderr or e.stdout}\n```"
-                logger.error(error_msg)
-                if len(error_msg) > 4000: error_msg = error_msg[:4000] + "\n... (Log truncated)"
-                bot.reply_to(message, error_msg, parse_mode='Markdown'); return
-            except Exception as e:
-                 error_msg = f"❌ Unexpected error installing Node deps: {e}"
-                 logger.error(error_msg, exc_info=True); bot.reply_to(message, error_msg); return
-
-        main_script_name = None; file_type = None
-        preferred_py = ['main.py', 'bot.py', 'app.py']; preferred_js = ['index.js', 'main.js', 'bot.js', 'app.js']
-        for p in preferred_py:
-            if p in py_files: main_script_name = p; file_type = 'py'; break
-        if not main_script_name:
-             for p in preferred_js:
-                 if p in js_files: main_script_name = p; file_type = 'js'; break
-        if not main_script_name:
-            if py_files: main_script_name = py_files[0]; file_type = 'py'
-            elif js_files: main_script_name = js_files[0]; file_type = 'js'
-        if not main_script_name:
-            bot.reply_to(message, "❌ No `.py` or `.js` script found in archive!"); return
-
-        logger.info(f"Moving extracted files from {temp_dir} to {user_folder}")
-        moved_count = 0
-        for item_name in os.listdir(temp_dir):
-            src_path = os.path.join(temp_dir, item_name)
-            dest_path = os.path.join(user_folder, item_name)
-            if os.path.isdir(dest_path): shutil.rmtree(dest_path)
-            elif os.path.exists(dest_path): os.remove(dest_path)
-            shutil.move(src_path, dest_path); moved_count +=1
-        logger.info(f"Moved {moved_count} items to {user_folder}")
-
-        save_user_file(user_id, main_script_name, file_type)
-        logger.info(f"Saved main script '{main_script_name}' ({file_type}) for {user_id} from zip.")
-        main_script_path = os.path.join(user_folder, main_script_name)
-        bot.reply_to(message, f"✅ Files extracted. Starting main script: `{main_script_name}`...", parse_mode='Markdown')
-
-        # Use user_id as script_owner_id for script key context
-        if file_type == 'py':
-             threading.Thread(target=run_script, args=(main_script_path, user_id, user_folder, main_script_name, message)).start()
-        elif file_type == 'js':
-             threading.Thread(target=run_js_script, args=(main_script_path, user_id, user_folder, main_script_name, message)).start()
-
-    except zipfile.BadZipFile as e:
-        logger.error(f"Bad zip file from {user_id}: {e}")
-        bot.reply_to(message, f"❌ Error: Invalid/corrupted ZIP. {e}")
-    except Exception as e:
-        logger.error(f"❌ Error processing zip for {user_id}: {e}", exc_info=True)
-        bot.reply_to(message, f"❌ Error processing zip: {str(e)}")
-    finally:
-        if temp_dir and os.path.exists(temp_dir):
-            try: shutil.rmtree(temp_dir); logger.info(f"Cleaned temp dir: {temp_dir}")
-            except Exception as e: logger.error(f"Failed to clean temp dir {temp_dir}: {e}", exc_info=True)
-
-def handle_js_file(file_path, script_owner_id, user_folder, file_name, message):
-    try:
-        save_user_file(script_owner_id, file_name, 'js')
-        threading.Thread(target=run_js_script, args=(file_path, script_owner_id, user_folder, file_name, message)).start()
-    except Exception as e:
-        logger.error(f"❌ Error processing JS file {file_name} for {script_owner_id}: {e}", exc_info=True)
-        bot.reply_to(message, f"❌ Error processing JS file: {str(e)}")
-
-def handle_py_file(file_path, script_owner_id, user_folder, file_name, message):
-    try:
-        save_user_file(script_owner_id, file_name, 'py')
-        threading.Thread(target=run_script, args=(file_path, script_owner_id, user_folder, file_name, message)).start()
-    except Exception as e:
-        logger.error(f"❌ Error processing Python file {file_name} for {script_owner_id}: {e}", exc_info=True)
-        bot.reply_to(message, f"❌ Error processing Python file: {str(e)}")
-# --- End File Handling ---
-
-
-# --- Logic Functions (called by commands and text handlers) ---
-def _logic_send_welcome(message):
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-    user_name = message.from_user.first_name
-    user_username = message.from_user.username
-
-    logger.info(f"Welcome request from user_id: {user_id}, username: @{user_username}")
-
-    if bot_locked and user_id not in admin_ids:
-        bot.send_message(chat_id, "⚠️ Bot locked by admin. Try later.")
-        return
-
-    user_bio = "Could not fetch bio"; photo_file_id = None
-    try: user_bio = bot.get_chat(user_id).bio or "No bio"
-    except Exception: pass
-    try:
-        user_profile_photos = bot.get_user_profile_photos(user_id, limit=1)
-        if user_profile_photos.photos: photo_file_id = user_profile_photos.photos[0][-1].file_id
-    except Exception: pass
-
-    if user_id not in active_users:
-        add_active_user(user_id)
-        try:
-            owner_notification = (f"🎉 New user!\n👤 Name: {user_name}\n✳️ User: @{user_username or 'N/A'}\n"
-                                  f"🆔 ID: `{user_id}`\n📝 Bio: {user_bio}")
-            bot.send_message(OWNER_ID, owner_notification, parse_mode='Markdown')
-            if photo_file_id: bot.send_photo(OWNER_ID, photo_file_id, caption=f"Pic of new user {user_id}")
-        except Exception as e: logger.error(f"⚠️ Failed to notify owner about new user {user_id}: {e}")
-
-    file_limit = get_user_file_limit(user_id)
-    current_files = get_user_file_count(user_id)
-    limit_str = str(file_limit) if file_limit != float('inf') else "Unlimited"
-    expiry_info = ""
-    if user_id == OWNER_ID: user_status = "👑 Owner"
-    elif user_id in admin_ids: user_status = "🛡️ Admin"
-    elif user_id in user_subscriptions:
-        expiry_date = user_subscriptions[user_id].get('expiry')
-        if expiry_date and expiry_date > datetime.now():
-            user_status = "⭐ Premium"; days_left = (expiry_date - datetime.now()).days
-            expiry_info = f"\n⏳ Subscription expires in: {days_left} days"
-        else: user_status = "🆓 Free User (Expired Sub)"; remove_subscription_db(user_id) # Clean up expired
-    else: user_status = "🆓 Free User"
-
-    welcome_msg_text = (f"〽️ Welcome, {user_name}!\n\n🆔 Your User ID: `{user_id}`\n"
-                        f"✳️ Username: `@{user_username or 'Not set'}`\n"
-                        f"🔰 Your Status: {user_status}{expiry_info}\n"
-                        f"📁 Files Uploaded: {current_files} / {limit_str}\n\n"
-                        f"🤖 Host & run Python (`.py`) or JS (`.js`) scripts.\n"
-                        f"   Upload single scripts or `.zip` archives.\n\n"
-                        f"👇 Use buttons or type commands.")
-    main_reply_markup = create_reply_keyboard_main_menu(user_id)
-    try:
-        if photo_file_id: bot.send_photo(chat_id, photo_file_id)
-        bot.send_message(chat_id, welcome_msg_text, reply_markup=main_reply_markup, parse_mode='Markdown')
-    except Exception as e:
-        logger.error(f"Error sending welcome to {user_id}: {e}", exc_info=True)
-        try: bot.send_message(chat_id, welcome_msg_text, reply_markup=main_reply_markup, parse_mode='Markdown') # Fallback without photo
-        except Exception as fallback_e: logger.error(f"Fallback send_message failed for {user_id}: {fallback_e}")
-
-def _logic_updates_channel(message):
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton('📢 Updates Channel', url=UPDATE_CHANNEL))
-    bot.reply_to(message, "Visit our Updates Channel:", reply_markup=markup)
-
-def _logic_upload_file(message):
-    user_id = message.from_user.id
-    if bot_locked and user_id not in admin_ids:
-        bot.reply_to(message, "⚠️ Bot locked by admin, cannot accept files.")
-        return
-
-    # Removed free_mode check, relies on get_user_file_limit and FREE_USER_LIMIT
-    # Users need to be admin or subscribed to upload if FREE_USER_LIMIT is 0
-    # For now, FREE_USER_LIMIT > 0, so free users can upload up to that limit.
-    # If we want to restrict free users entirely, set FREE_USER_LIMIT to 0.
-    # For this implementation, free users get FREE_USER_LIMIT.
-
-    file_limit = get_user_file_limit(user_id)
-    current_files = get_user_file_count(user_id)
-    if current_files >= file_limit:
-        limit_str = str(file_limit) if file_limit != float('inf') else "Unlimited"
-        bot.reply_to(message, f"⚠️ File limit ({current_files}/{limit_str}) reached. Delete files first.")
-        return
-    bot.reply_to(message, "📤 Send your Python (`.py`), JS (`.js`), or ZIP (`.zip`) file.")
-
-def _logic_check_files(message):
-    user_id = message.from_user.id
-    # chat_id = message.chat.id # user_id will be used as script_owner_id for buttons
-    user_files_list = user_files.get(user_id, [])
-    if not user_files_list:
-        bot.reply_to(message, "📂 Your files:\n\n(No files uploaded yet)")
-        return
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    for file_name, file_type in sorted(user_files_list):
-        is_running = is_bot_running(user_id, file_name) # Use user_id for checking status
-        status_icon = "🟢 Running" if is_running else "🔴 Stopped"
-        btn_text = f"{file_name} ({file_type}) - {status_icon}"
-        # Callback data includes user_id as script_owner_id
-        markup.add(types.InlineKeyboardButton(btn_text, callback_data=f'file_{user_id}_{file_name}'))
-    bot.reply_to(message, "📂 Your files:\nClick to manage.", reply_markup=markup, parse_mode='Markdown')
-
-def _logic_bot_speed(message):
-    user_id = message.from_user.id
-    chat_id = message.chat.id
-    start_time_ping = time.time()
-    wait_msg = bot.reply_to(message, "🏃 Testing speed...")
-    try:
-        bot.send_chat_action(chat_id, 'typing')
-        response_time = round((time.time() - start_time_ping) * 1000, 2)
-        status = "🔓 Unlocked" if not bot_locked else "🔒 Locked"
-        # mode = "💰 Free Mode: ON" if free_mode else "💸 Free Mode: OFF" # Removed free_mode
-        if user_id == OWNER_ID: user_level = "👑 Owner"
-        elif user_id in admin_ids: user_level = "🛡️ Admin"
-        elif user_id in user_subscriptions and user_subscriptions[user_id].get('expiry', datetime.min) > datetime.now(): user_level = "⭐ Premium"
-        else: user_level = "🆓 Free User"
-        speed_msg = (f"⚡ Bot Speed & Status:\n\n⏱️ API Response Time: {response_time} ms\n"
-                     f"🚦 Bot Status: {status}\n"
-                     # f"模式 Mode: {mode}\n" # Removed
-                     f"👤 Your Level: {user_level}")
-        bot.edit_message_text(speed_msg, chat_id, wait_msg.message_id)
-    except Exception as e:
-        logger.error(f"Error during speed test (cmd): {e}", exc_info=True)
-        bot.edit_message_text("❌ Error during speed test.", chat_id, wait_msg.message_id)
-
-def _logic_contact_owner(message):
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton('📞 Contact Owner', url=f'https://t.me/{YOUR_USERNAME.replace("@", "")}'))
-    bot.reply_to(message, "Click to contact Owner:", reply_markup=markup)
-
-# --- Admin Logic Functions ---
-def _logic_subscriptions_panel(message):
-    if message.from_user.id not in admin_ids:
-        bot.reply_to(message, "⚠️ Admin permissions required.")
-        return
-    bot.reply_to(message, "💳 Subscription Management\nUse inline buttons from /start or admin command menu.", reply_markup=create_subscription_menu())
-
-def _logic_statistics(message):
-    # No admin check here, allow all users but show admin-specific info if admin
-    user_id = message.from_user.id
-    total_users = len(active_users)
-    total_files_records = sum(len(files) for files in user_files.values())
-
-    running_bots_count = 0
-    user_running_bots = 0
-
-    for script_key_iter, script_info_iter in list(bot_scripts.items()):
-        s_owner_id, _ = script_key_iter.split('_', 1) # Extract owner_id from key
-        if is_bot_running(int(s_owner_id), script_info_iter['file_name']):
-            running_bots_count += 1
-            if int(s_owner_id) == user_id:
-                user_running_bots +=1
-
-    stats_msg_base = (f"📊 Bot Statistics:\n\n"
-                      f"👥 Total Users: {total_users}\n"
-                      f"📂 Total File Records: {total_files_records}\n"
-                      f"🟢 Total Active Bots: {running_bots_count}\n")
-
-    if user_id in admin_ids:
-        stats_msg_admin = (f"🔒 Bot Status: {'🔴 Locked' if bot_locked else '🟢 Unlocked'}\n"
-                           # f"💰 Free Mode: {'✅ ON' if free_mode else '❌ OFF'}\n" # Removed
-                           f"🤖 Your Running Bots: {user_running_bots}")
-        stats_msg = stats_msg_base + stats_msg_admin
-    else:
-        stats_msg = stats_msg_base + f"🤖 Your Running Bots: {user_running_bots}"
-
-    bot.reply_to(message, stats_msg)
-
-
-def _logic_broadcast_init(message):
-    if message.from_user.id not in admin_ids:
-        bot.reply_to(message, "⚠️ Admin permissions required.")
-        return
-    msg = bot.reply_to(message, "📢 Send message to broadcast to all active users.\n/cancel to abort.")
-    bot.register_next_step_handler(msg, process_broadcast_message)
-
-def _logic_toggle_lock_bot(message):
-    if message.from_user.id not in admin_ids:
-        bot.reply_to(message, "⚠️ Admin permissions required.")
-        return
-    global bot_locked
-    bot_locked = not bot_locked
-    status = "locked" if bot_locked else "unlocked"
-    logger.warning(f"Bot {status} by Admin {message.from_user.id} via command/button.")
-    bot.reply_to(message, f"🔒 Bot has been {status}.")
-
-# def _logic_toggle_free_mode(message): # Removed
-#     pass
-
-def _logic_admin_panel(message):
-    if message.from_user.id not in admin_ids:
-        bot.reply_to(message, "⚠️ Admin permissions required.")
-        return
-    bot.reply_to(message, "👑 Admin Panel\nManage admins. Use inline buttons from /start or admin menu.",
-                 reply_markup=create_admin_panel())
-
-def _logic_run_all_scripts(message_or_call):
-    if isinstance(message_or_call, telebot.types.Message):
-        admin_user_id = message_or_call.from_user.id
-        admin_chat_id = message_or_call.chat.id
-        reply_func = lambda text, **kwargs: bot.reply_to(message_or_call, text, **kwargs)
-        admin_message_obj_for_script_runner = message_or_call
-    elif isinstance(message_or_call, telebot.types.CallbackQuery):
-        admin_user_id = message_or_call.from_user.id
-        admin_chat_id = message_or_call.message.chat.id
-        bot.answer_callback_query(message_or_call.id)
-        reply_func = lambda text, **kwargs: bot.send_message(admin_chat_id, text, **kwargs)
-        admin_message_obj_for_script_runner = message_or_call.message 
-    else:
-        logger.error("Invalid argument for _logic_run_all_scripts")
-        return
-
-    if admin_user_id not in admin_ids:
-        reply_func("⚠️ Admin permissions required.")
-        return
-
-    reply_func("⏳ Starting process to run all user scripts. This may take a while...")
-    logger.info(f"Admin {admin_user_id} initiated 'run all scripts' from chat {admin_chat_id}.")
-
-    started_count = 0; attempted_users = 0; skipped_files = 0; error_files_details = []
-
-    # Use a copy of user_files keys and values to avoid modification issues during iteration
-    all_user_files_snapshot = dict(user_files)
-
-    for target_user_id, files_for_user in all_user_files_snapshot.items():
-        if not files_for_user: continue
-        attempted_users += 1
-        logger.info(f"Processing scripts for user {target_user_id}...")
-        user_folder = get_user_folder(target_user_id)
-
-        for file_name, file_type in files_for_user:
-            # script_owner_id for key context is target_user_id
-            if not is_bot_running(target_user_id, file_name):
-                file_path = os.path.join(user_folder, file_name)
-                if os.path.exists(file_path):
-                    logger.info(f"Admin {admin_user_id} attempting to start '{file_name}' ({file_type}) for user {target_user_id}.")
-                    try:
-                        if file_type == 'py':
-                            threading.Thread(target=run_script, args=(file_path, target_user_id, user_folder, file_name, admin_message_obj_for_script_runner)).start()
-                            started_count += 1
-                        elif file_type == 'js':
-                            threading.Thread(target=run_js_script, args=(file_path, target_user_id, user_folder, file_name, admin_message_obj_for_script_runner)).start()
-                            started_count += 1
-                        else:
-                            logger.warning(f"Unknown file type '{file_type}' for {file_name} (user {target_user_id}). Skipping.")
-                            error_files_details.append(f"`{file_name}` (User {target_user_id}) - Unknown type")
-                            skipped_files += 1
-                        time.sleep(0.7) # Increased delay slightly
-                    except Exception as e:
-                        logger.error(f"Error queueing start for '{file_name}' (user {target_user_id}): {e}")
-                        error_files_details.append(f"`{file_name}` (User {target_user_id}) - Start error")
-                        skipped_files += 1
-                else:
-                    logger.warning(f"File '{file_name}' for user {target_user_id} not found at '{file_path}'. Skipping.")
-                    error_files_details.append(f"`{file_name}` (User {target_user_id}) - File not found")
-                    skipped_files += 1
-            # else: logger.info(f"Script '{file_name}' for user {target_user_id} already running.")
-
-    summary_msg = (f"✅ All Users' Scripts - Processing Complete:\n\n"
-                   f"▶️ Attempted to start: {started_count} scripts.\n"
-                   f"👥 Users processed: {attempted_users}.\n")
-    if skipped_files > 0:
-        summary_msg += f"⚠️ Skipped/Error files: {skipped_files}\n"
-        if error_files_details:
-             summary_msg += "Details (first 5):\n" + "\n".join([f"  - {err}" for err in error_files_details[:5]])
-             if len(error_files_details) > 5: summary_msg += "\n  ... and more (check logs)."
-
-    reply_func(summary_msg, parse_mode='Markdown')
-    logger.info(f"Run all scripts finished. Admin: {admin_user_id}. Started: {started_count}. Skipped/Errors: {skipped_files}")
-
-
-# --- Command Handlers & Text Handlers for ReplyKeyboard ---
-@bot.message_handler(commands=['start', 'help'])
-def command_send_welcome(message): _logic_send_welcome(message)
-
-@bot.message_handler(commands=['status']) # Kept for direct command
-def command_show_status(message): _logic_statistics(message) # Changed to call _logic_statistics
-
-
-BUTTON_TEXT_TO_LOGIC = {
-    "📢 Updates Channel": _logic_updates_channel,
-    "📤 Upload File": _logic_upload_file,
-    "📂 Check Files": _logic_check_files,
-    "⚡ Bot Speed": _logic_bot_speed,
-    "📞 Contact Owner": _logic_contact_owner,
-    "📊 Statistics": _logic_statistics, 
-    "💳 Subscriptions": _logic_subscriptions_panel,
-    "📢 Broadcast": _logic_broadcast_init,
-    "🔒 Lock Bot": _logic_toggle_lock_bot, 
-    # "💰 Free Mode": _logic_toggle_free_mode, # Removed
-    "🟢 Running All Code": _logic_run_all_scripts, # Added
-    "👑 Admin Panel": _logic_admin_panel,
-}
-
-@bot.message_handler(func=lambda message: message.text in BUTTON_TEXT_TO_LOGIC)
-def handle_button_text(message):
-    logic_func = BUTTON_TEXT_TO_LOGIC.get(message.text)
-    if logic_func: logic_func(message)
-    else: logger.warning(f"Button text '{message.text}' matched but no logic func.")
-
-@bot.message_handler(commands=['updateschannel'])
-def command_updates_channel(message): _logic_updates_channel(message)
-@bot.message_handler(commands=['uploadfile'])
-def command_upload_file(message): _logic_upload_file(message)
-@bot.message_handler(commands=['checkfiles'])
-def command_check_files(message): _logic_check_files(message)
-@bot.message_handler(commands=['botspeed'])
-def command_bot_speed(message): _logic_bot_speed(message)
-@bot.message_handler(commands=['contactowner'])
-def command_contact_owner(message): _logic_contact_owner(message)
-@bot.message_handler(commands=['subscriptions'])
-def command_subscriptions(message): _logic_subscriptions_panel(message)
-@bot.message_handler(commands=['statistics']) # Alias for /status
-def command_statistics(message): _logic_statistics(message)
-@bot.message_handler(commands=['broadcast'])
-def command_broadcast(message): _logic_broadcast_init(message)
-@bot.message_handler(commands=['lockbot']) 
-def command_lock_bot(message): _logic_toggle_lock_bot(message)
-# @bot.message_handler(commands=['freemode']) # Removed
-# def command_free_mode(message): _logic_toggle_free_mode(message)
-@bot.message_handler(commands=['adminpanel'])
-def command_admin_panel(message): _logic_admin_panel(message)
-@bot.message_handler(commands=['runningallcode']) # Added
-def command_run_all_code(message): _logic_run_all_scripts(message)
-
-
-@bot.message_handler(commands=['ping'])
-def ping(message):
-    start_ping_time = time.time() 
-    msg = bot.reply_to(message, "Pong!")
-    latency = round((time.time() - start_ping_time) * 1000, 2)
-    bot.edit_message_text(f"Pong! Latency: {latency} ms", message.chat.id, msg.message_id)
-
-
-# --- Document (File) Handler ---
-@bot.message_handler(content_types=['document'])
-def handle_file_upload_doc(message): # Renamed
-    user_id = message.from_user.id
-    chat_id = message.chat.id # Used for replies, script context uses user_id
-    doc = message.document
-    logger.info(f"Doc from {user_id}: {doc.file_name} ({doc.mime_type}), Size: {doc.file_size}")
-
-    if bot_locked and user_id not in admin_ids:
-        bot.reply_to(message, "⚠️ Bot locked, cannot accept files.")
-        return
-
-    # File limit check (relies on FREE_USER_LIMIT being > 0 for free users)
-    file_limit = get_user_file_limit(user_id)
-    current_files = get_user_file_count(user_id)
-    if current_files >= file_limit:
-        limit_str = str(file_limit) if file_limit != float('inf') else "Unlimited"
-        bot.reply_to(message, f"⚠️ File limit ({current_files}/{limit_str}) reached. Delete files via /checkfiles.")
-        return
-
-    file_name = doc.file_name
-    if not file_name: bot.reply_to(message, "⚠️ No file name. Ensure file has a name."); return
-    file_ext = os.path.splitext(file_name)[1].lower()
-    if file_ext not in ['.py', '.js', '.zip']:
-        bot.reply_to(message, "⚠️ Unsupported type! Only `.py`, `.js`, `.zip` allowed.")
-        return
-    max_file_size = 20 * 1024 * 1024 # 20 MB
-    if doc.file_size > max_file_size:
-        bot.reply_to(message, f"⚠️ File too large (Max: {max_file_size // 1024 // 1024} MB)."); return
-
-    try:
-        try:
-            bot.forward_message(OWNER_ID, chat_id, message.message_id)
-            bot.send_message(OWNER_ID, f"⬆️ File '{file_name}' from {message.from_user.first_name} (`{user_id}`)", parse_mode='Markdown')
-        except Exception as e: logger.error(f"Failed to forward uploaded file to OWNER_ID {OWNER_ID}: {e}")
-
-        download_wait_msg = bot.reply_to(message, f"⏳ Downloading `{file_name}`...")
-        file_info_tg_doc = bot.get_file(doc.file_id) # Renamed
-        downloaded_file_content = bot.download_file(file_info_tg_doc.file_path)
-        bot.edit_message_text(f"✅ Downloaded `{file_name}`. Processing...", chat_id, download_wait_msg.message_id)
-        logger.info(f"Downloaded {file_name} for user {user_id}")
-        user_folder = get_user_folder(user_id)
-
-        if file_ext == '.zip':
-            handle_zip_file(downloaded_file_content, file_name, message)
-        else:
-            file_path = os.path.join(user_folder, file_name)
-            with open(file_path, 'wb') as f: f.write(downloaded_file_content)
-            logger.info(f"Saved single file to {file_path}")
-            # Pass user_id as script_owner_id
-            if file_ext == '.js': handle_js_file(file_path, user_id, user_folder, file_name, message)
-            elif file_ext == '.py': handle_py_file(file_path, user_id, user_folder, file_name, message)
-    except telebot.apihelper.ApiTelegramException as e:
-         logger.error(f"Telegram API Error handling file for {user_id}: {e}", exc_info=True)
-         if "file is too big" in str(e).lower():
-              bot.reply_to(message, f"❌ Telegram API Error: File too large to download (~20MB limit).")
-         else: bot.reply_to(message, f"❌ Telegram API Error: {str(e)}. Try later.")
-    except Exception as e:
-        logger.error(f"❌ General error handling file for {user_id}: {e}", exc_info=True)
-        bot.reply_to(message, f"❌ Unexpected error: {str(e)}")
-# --- End Document Handler ---
-
-
-# --- Callback Query Handlers (for Inline Buttons) ---
-@bot.callback_query_handler(func=lambda call: True) 
-def handle_callbacks(call):
-    user_id = call.from_user.id
-    data = call.data
-    logger.info(f"Callback: User={user_id}, Data='{data}'")
-
-    if bot_locked and user_id not in admin_ids and data not in ['back_to_main', 'speed', 'stats']: # Allow stats
-        bot.answer_callback_query(call.id, "⚠️ Bot locked by admin.", show_alert=True)
-        return
-    try:
-        if data == 'upload': upload_callback(call)
-        elif data == 'check_files': check_files_callback(call)
-        elif data.startswith('file_'): file_control_callback(call)
-        elif data.startswith('start_'): start_bot_callback(call)
-        elif data.startswith('stop_'): stop_bot_callback(call)
-        elif data.startswith('restart_'): restart_bot_callback(call)
-        elif data.startswith('delete_'): delete_bot_callback(call)
-        elif data.startswith('logs_'): logs_bot_callback(call)
-        elif data == 'speed': speed_callback(call)
-        elif data == 'back_to_main': back_to_main_callback(call)
-        elif data.startswith('confirm_broadcast_'): handle_confirm_broadcast(call)
-        elif data == 'cancel_broadcast': handle_cancel_broadcast(call)
-        # --- Admin Callbacks ---
-        elif data == 'subscription': admin_required_callback(call, subscription_management_callback)
-        elif data == 'stats': stats_callback(call) # No admin check here, handled in func
-        elif data == 'lock_bot': admin_required_callback(call, lock_bot_callback)
-        elif data == 'unlock_bot': admin_required_callback(call, unlock_bot_callback)
-        # elif data == 'free_mode': admin_required_callback(call, toggle_free_mode_callback) # Removed
-        elif data == 'run_all_scripts': admin_required_callback(call, run_all_scripts_callback) # Added
-        elif data == 'broadcast': admin_required_callback(call, broadcast_init_callback) 
-        elif data == 'admin_panel': admin_required_callback(call, admin_panel_callback)
-        elif data == 'add_admin': owner_required_callback(call, add_admin_init_callback) 
-        elif data == 'remove_admin': owner_required_callback(call, remove_admin_init_callback) 
-        elif data == 'list_admins': admin_required_callback(call, list_admins_callback)
-        elif data == 'add_subscription': admin_required_callback(call, add_subscription_init_callback) 
-        elif data == 'remove_subscription': admin_required_callback(call, remove_subscription_init_callback) 
-        elif data == 'check_subscription': admin_required_callback(call, check_subscription_init_callback) 
-        else:
-            bot.answer_callback_query(call.id, "Unknown action.")
-            logger.warning(f"Unhandled callback data: {data} from user {user_id}")
-    except Exception as e:
-        logger.error(f"Error handling callback '{data}' for {user_id}: {e}", exc_info=True)
-        try: bot.answer_callback_query(call.id, "Error processing request.", show_alert=True)
-        except Exception as e_ans: logger.error(f"Failed to answer callback after error: {e_ans}")
-
-def admin_required_callback(call, func_to_run):
-    if call.from_user.id not in admin_ids:
-        bot.answer_callback_query(call.id, "⚠️ Admin permissions required.", show_alert=True)
-        return
-    func_to_run(call) 
-
-def owner_required_callback(call, func_to_run):
-    if call.from_user.id != OWNER_ID:
-        bot.answer_callback_query(call.id, "⚠️ Owner permissions required.", show_alert=True)
-        return
-    func_to_run(call)
-
-def upload_callback(call):
-    user_id = call.from_user.id
-    # Removed free_mode check
-    file_limit = get_user_file_limit(user_id)
-    current_files = get_user_file_count(user_id)
-    if current_files >= file_limit:
-        limit_str = str(file_limit) if file_limit != float('inf') else "Unlimited"
-        bot.answer_callback_query(call.id, f"⚠️ File limit ({current_files}/{limit_str}) reached.", show_alert=True)
-        return
-    bot.answer_callback_query(call.id) 
-    bot.send_message(call.message.chat.id, "📤 Send your Python (`.py`), JS (`.js`), or ZIP (`.zip`) file.")
-
-def check_files_callback(call):
-    user_id = call.from_user.id
-    chat_id = call.message.chat.id 
-    user_files_list = user_files.get(user_id, [])
-    if not user_files_list:
-        bot.answer_callback_query(call.id, "⚠️ No files uploaded.", show_alert=True)
-        try:
-            markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("🔙 Back to Main", callback_data='back_to_main'))
-            bot.edit_message_text("📂 Your files:\n\n(No files uploaded)", chat_id, call.message.message_id, reply_markup=markup)
-        except Exception as e: logger.error(f"Error editing msg for empty file list: {e}")
-        return
-    bot.answer_callback_query(call.id) 
-    markup = types.InlineKeyboardMarkup(row_width=1) 
-    for file_name, file_type in sorted(user_files_list): 
-        is_running = is_bot_running(user_id, file_name) # Use user_id for status check
-        status_icon = "🟢 Running" if is_running else "🔴 Stopped"
-        btn_text = f"{file_name} ({file_type}) - {status_icon}"
-        # Callback includes user_id as script_owner_id
-        markup.add(types.InlineKeyboardButton(btn_text, callback_data=f'file_{user_id}_{file_name}'))
-    markup.add(types.InlineKeyboardButton("🔙 Back to Main", callback_data='back_to_main'))
-    try:
-        bot.edit_message_text("📂 Your files:\nClick to manage.", chat_id, call.message.message_id, reply_markup=markup, parse_mode='Markdown')
-    except telebot.apihelper.ApiTelegramException as e:
-         if "message is not modified" in str(e): logger.warning("Msg not modified (files).")
-         else: logger.error(f"Error editing msg for file list: {e}")
-    except Exception as e: logger.error(f"Unexpected error editing msg for file list: {e}", exc_info=True)
-
-def file_control_callback(call):
-    try:
-        _, script_owner_id_str, file_name = call.data.split('_', 2)
-        script_owner_id = int(script_owner_id_str)
-        requesting_user_id = call.from_user.id
-
-        # Allow owner/admin to control any file, or user to control their own
-        if not (requesting_user_id == script_owner_id or requesting_user_id in admin_ids):
-            logger.warning(f"User {requesting_user_id} tried to access file '{file_name}' of user {script_owner_id} without permission.")
-            bot.answer_callback_query(call.id, "⚠️ You can only manage your own files.", show_alert=True)
-            check_files_callback(call) # Show their own files
-            return
-
-        user_files_list = user_files.get(script_owner_id, [])
-        if not any(f[0] == file_name for f in user_files_list):
-            logger.warning(f"File '{file_name}' not found for user {script_owner_id} during control.")
-            bot.answer_callback_query(call.id, "⚠️ File not found.", show_alert=True)
-            # If admin was viewing, this might be confusing. For now, just show their own.
-            check_files_callback(call) 
-            return
-
-        bot.answer_callback_query(call.id) 
-        is_running = is_bot_running(script_owner_id, file_name)
-        status_text = '🟢 Running' if is_running else '🔴 Stopped'
-        file_type = next((f[1] for f in user_files_list if f[0] == file_name), '?') 
-        try:
-            bot.edit_message_text(
-                f"⚙️ Controls for: `{file_name}` ({file_type}) of User `{script_owner_id}`\nStatus: {status_text}",
-                call.message.chat.id, call.message.message_id,
-                reply_markup=create_control_buttons(script_owner_id, file_name, is_running),
-                parse_mode='Markdown'
-            )
-        except telebot.apihelper.ApiTelegramException as e:
-             if "message is not modified" in str(e): logger.warning(f"Msg not modified (controls for {file_name})")
-             else: raise 
-    except (ValueError, IndexError) as ve:
-        logger.error(f"Error parsing file control callback: {ve}. Data: '{call.data}'")
-        bot.answer_callback_query(call.id, "Error: Invalid action data.", show_alert=True)
-    except Exception as e:
-        logger.error(f"Error in file_control_callback for data '{call.data}': {e}", exc_info=True)
-        bot.answer_callback_query(call.id, "An error occurred.", show_alert=True)
-
-def start_bot_callback(call):
-    try:
-        _, script_owner_id_str, file_name = call.data.split('_', 2)
-        script_owner_id = int(script_owner_id_str)
-        requesting_user_id = call.from_user.id
-        chat_id_for_reply = call.message.chat.id # Where the admin/user gets the reply
-
-        logger.info(f"Start request: Requester={requesting_user_id}, Owner={script_owner_id}, File='{file_name}'")
-
-        if not (requesting_user_id == script_owner_id or requesting_user_id in admin_ids):
-            bot.answer_callback_query(call.id, "⚠️ Permission denied to start this script.", show_alert=True); return
-
-        user_files_list = user_files.get(script_owner_id, [])
-        file_info = next((f for f in user_files_list if f[0] == file_name), None)
-        if not file_info:
-            bot.answer_callback_query(call.id, "⚠️ File not found.", show_alert=True); check_files_callback(call); return
-
-        file_type = file_info[1]
-        user_folder = get_user_folder(script_owner_id)
-        file_path = os.path.join(user_folder, file_name)
-
-        if not os.path.exists(file_path):
-            bot.answer_callback_query(call.id, f"⚠️ Error: File `{file_name}` missing! Re-upload.", show_alert=True)
-            remove_user_file_db(script_owner_id, file_name); check_files_callback(call); return
-
-        if is_bot_running(script_owner_id, file_name):
-            bot.answer_callback_query(call.id, f"⚠️ Script '{file_name}' already running.", show_alert=True)
-            try: bot.edit_message_reply_markup(chat_id_for_reply, call.message.message_id, reply_markup=create_control_buttons(script_owner_id, file_name, True))
-            except Exception as e: logger.error(f"Error updating buttons (already running): {e}")
-            return
-
-        bot.answer_callback_query(call.id, f"⏳ Attempting to start {file_name} for user {script_owner_id}...")
-
-        # Pass call.message as message_obj_for_reply so feedback goes to the person who clicked
-        if file_type == 'py':
-            threading.Thread(target=run_script, args=(file_path, script_owner_id, user_folder, file_name, call.message)).start()
-        elif file_type == 'js':
-            threading.Thread(target=run_js_script, args=(file_path, script_owner_id, user_folder, file_name, call.message)).start()
-        else:
-             bot.send_message(chat_id_for_reply, f"❌ Error: Unknown file type '{file_type}' for '{file_name}'."); return 
-
-        time.sleep(1.5) # Give script time to actually start or fail early
-        is_now_running = is_bot_running(script_owner_id, file_name) 
-        status_text = '🟢 Running' if is_now_running else '🟡 Starting (or failed, check logs/replies)'
-        try:
-            bot.edit_message_text(
-                f"⚙️ Controls for: `{file_name}` ({file_type}) of User `{script_owner_id}`\nStatus: {status_text}",
-                chat_id_for_reply, call.message.message_id,
-                reply_markup=create_control_buttons(script_owner_id, file_name, is_now_running), parse_mode='Markdown'
-            )
-        except telebot.apihelper.ApiTelegramException as e:
-             if "message is not modified" in str(e): logger.warning(f"Msg not modified after starting {file_name}")
-             else: raise
-    except (ValueError, IndexError) as e:
-        logger.error(f"Error parsing start callback '{call.data}': {e}")
-        bot.answer_callback_query(call.id, "Error: Invalid start command.", show_alert=True)
-    except Exception as e:
-        logger.error(f"Error in start_bot_callback for '{call.data}': {e}", exc_info=True)
-        bot.answer_callback_query(call.id, "Error starting script.", show_alert=True)
-        try: # Attempt to reset buttons to 'stopped' state on error
-            _, script_owner_id_err_str, file_name_err = call.data.split('_', 2)
-            script_owner_id_err = int(script_owner_id_err_str)
-            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=create_control_buttons(script_owner_id_err, file_name_err, False))
-        except Exception as e_btn: logger.error(f"Failed to update buttons after start error: {e_btn}")
-
-def stop_bot_callback(call):
-    try:
-        _, script_owner_id_str, file_name = call.data.split('_', 2)
-        script_owner_id = int(script_owner_id_str)
-        requesting_user_id = call.from_user.id
-        chat_id_for_reply = call.message.chat.id
-
-        logger.info(f"Stop request: Requester={requesting_user_id}, Owner={script_owner_id}, File='{file_name}'")
-        if not (requesting_user_id == script_owner_id or requesting_user_id in admin_ids):
-            bot.answer_callback_query(call.id, "⚠️ Permission denied.", show_alert=True); return
-
-        user_files_list = user_files.get(script_owner_id, [])
-        file_info = next((f for f in user_files_list if f[0] == file_name), None)
-        if not file_info:
-            bot.answer_callback_query(call.id, "⚠️ File not found.", show_alert=True); check_files_callback(call); return
-
-        file_type = file_info[1] 
-        script_key = f"{script_owner_id}_{file_name}"
-
-        if not is_bot_running(script_owner_id, file_name): 
-            bot.answer_callback_query(call.id, f"⚠️ Script '{file_name}' already stopped.", show_alert=True)
-            try:
-                 bot.edit_message_text(
-                     f"⚙️ Controls for: `{file_name}` ({file_type}) of User `{script_owner_id}`\nStatus: 🔴 Stopped",
-                     chat_id_for_reply, call.message.message_id,
-                     reply_markup=create_control_buttons(script_owner_id, file_name, False), parse_mode='Markdown')
-            except Exception as e: logger.error(f"Error updating buttons (already stopped): {e}")
-            return
-
-        bot.answer_callback_query(call.id, f"⏳ Stopping {file_name} for user {script_owner_id}...")
-        process_info = bot_scripts.get(script_key)
-        if process_info:
-            kill_process_tree(process_info)
-            if script_key in bot_scripts: del bot_scripts[script_key]; logger.info(f"Removed {script_key} from running after stop.")
-        else: logger.warning(f"Script {script_key} running by psutil but not in bot_scripts dict.")
-
-        try:
-            bot.edit_message_text(
-                f"⚙️ Controls for: `{file_name}` ({file_type}) of User `{script_owner_id}`\nStatus: 🔴 Stopped",
-                chat_id_for_reply, call.message.message_id,
-                reply_markup=create_control_buttons(script_owner_id, file_name, False), parse_mode='Markdown'
-            )
-        except telebot.apihelper.ApiTelegramException as e:
-             if "message is not modified" in str(e): logger.warning(f"Msg not modified after stopping {file_name}")
-             else: raise
-    except (ValueError, IndexError) as e:
-        logger.error(f"Error parsing stop callback '{call.data}': {e}")
-        bot.answer_callback_query(call.id, "Error: Invalid stop command.", show_alert=True)
-    except Exception as e:
-        logger.error(f"Error in stop_bot_callback for '{call.data}': {e}", exc_info=True)
-        bot.answer_callback_query(call.id, "Error stopping script.", show_alert=True)
-
-def restart_bot_callback(call):
-    try:
-        _, script_owner_id_str, file_name = call.data.split('_', 2)
-        script_owner_id = int(script_owner_id_str)
-        requesting_user_id = call.from_user.id
-        chat_id_for_reply = call.message.chat.id
-
-        logger.info(f"Restart: Requester={requesting_user_id}, Owner={script_owner_id}, File='{file_name}'")
-        if not (requesting_user_id == script_owner_id or requesting_user_id in admin_ids):
-            bot.answer_callback_query(call.id, "⚠️ Permission denied.", show_alert=True); return
-
-        user_files_list = user_files.get(script_owner_id, [])
-        file_info = next((f for f in user_files_list if f[0] == file_name), None)
-        if not file_info:
-            bot.answer_callback_query(call.id, "⚠️ File not found.", show_alert=True); check_files_callback(call); return
-
-        file_type = file_info[1]; user_folder = get_user_folder(script_owner_id)
-        file_path = os.path.join(user_folder, file_name); script_key = f"{script_owner_id}_{file_name}"
-
-        if not os.path.exists(file_path):
-            bot.answer_callback_query(call.id, f"⚠️ Error: File `{file_name}` missing! Re-upload.", show_alert=True)
-            remove_user_file_db(script_owner_id, file_name)
-            if script_key in bot_scripts: del bot_scripts[script_key]
-            check_files_callback(call); return
-
-        bot.answer_callback_query(call.id, f"⏳ Restarting {file_name} for user {script_owner_id}...")
-        if is_bot_running(script_owner_id, file_name):
-            logger.info(f"Restart: Stopping existing {script_key}...")
-            process_info = bot_scripts.get(script_key)
-            if process_info: kill_process_tree(process_info)
-            if script_key in bot_scripts: del bot_scripts[script_key]
-            time.sleep(1.5) 
-
-        logger.info(f"Restart: Starting script {script_key}...")
-        if file_type == 'py':
-            threading.Thread(target=run_script, args=(file_path, script_owner_id, user_folder, file_name, call.message)).start()
-        elif file_type == 'js':
-            threading.Thread(target=run_js_script, args=(file_path, script_owner_id, user_folder, file_name, call.message)).start()
-        else:
-             bot.send_message(chat_id_for_reply, f"❌ Unknown type '{file_type}' for '{file_name}'."); return
-
-        time.sleep(1.5) 
-        is_now_running = is_bot_running(script_owner_id, file_name) 
-        status_text = '🟢 Running' if is_now_running else '🟡 Starting (or failed)'
-        try:
-            bot.edit_message_text(
-                f"⚙️ Controls for: `{file_name}` ({file_type}) of User `{script_owner_id}`\nStatus: {status_text}",
-                chat_id_for_reply, call.message.message_id,
-                reply_markup=create_control_buttons(script_owner_id, file_name, is_now_running), parse_mode='Markdown'
-            )
-        except telebot.apihelper.ApiTelegramException as e:
-             if "message is not modified" in str(e): logger.warning(f"Msg not modified (restart {file_name})")
-             else: raise
-    except (ValueError, IndexError) as e:
-        logger.error(f"Error parsing restart callback '{call.data}': {e}")
-        bot.answer_callback_query(call.id, "Error: Invalid restart command.", show_alert=True)
-    except Exception as e:
-        logger.error(f"Error in restart_bot_callback for '{call.data}': {e}", exc_info=True)
-        bot.answer_callback_query(call.id, "Error restarting.", show_alert=True)
-        try:
-            _, script_owner_id_err_str, file_name_err = call.data.split('_', 2)
-            script_owner_id_err = int(script_owner_id_err_str)
-            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=create_control_buttons(script_owner_id_err, file_name_err, False))
-        except Exception as e_btn: logger.error(f"Failed to update buttons after restart error: {e_btn}")
-
-
-def delete_bot_callback(call):
-    try:
-        _, script_owner_id_str, file_name = call.data.split('_', 2)
-        script_owner_id = int(script_owner_id_str)
-        requesting_user_id = call.from_user.id
-        chat_id_for_reply = call.message.chat.id
-
-        logger.info(f"Delete: Requester={requesting_user_id}, Owner={script_owner_id}, File='{file_name}'")
-        if not (requesting_user_id == script_owner_id or requesting_user_id in admin_ids):
-            bot.answer_callback_query(call.id, "⚠️ Permission denied.", show_alert=True); return
-
-        user_files_list = user_files.get(script_owner_id, [])
-        if not any(f[0] == file_name for f in user_files_list):
-            bot.answer_callback_query(call.id, "⚠️ File not found.", show_alert=True); check_files_callback(call); return
-
-        bot.answer_callback_query(call.id, f"🗑️ Deleting {file_name} for user {script_owner_id}...")
-        script_key = f"{script_owner_id}_{file_name}"
-        if is_bot_running(script_owner_id, file_name):
-            logger.info(f"Delete: Stopping {script_key}...")
-            process_info = bot_scripts.get(script_key)
-            if process_info: kill_process_tree(process_info)
-            if script_key in bot_scripts: del bot_scripts[script_key]
-            time.sleep(0.5) 
-
-        user_folder = get_user_folder(script_owner_id)
-        file_path = os.path.join(user_folder, file_name)
-        log_path = os.path.join(user_folder, f"{os.path.splitext(file_name)[0]}.log")
-        deleted_disk = []
-        if os.path.exists(file_path):
-            try: os.remove(file_path); deleted_disk.append(file_name); logger.info(f"Deleted file: {file_path}")
-            except OSError as e: logger.error(f"Error deleting {file_path}: {e}")
-        if os.path.exists(log_path):
-            try: os.remove(log_path); deleted_disk.append(os.path.basename(log_path)); logger.info(f"Deleted log: {log_path}")
-            except OSError as e: logger.error(f"Error deleting log {log_path}: {e}")
-
-        remove_user_file_db(script_owner_id, file_name)
-        deleted_str = ", ".join(f"`{f}`" for f in deleted_disk) if deleted_disk else "associated files"
-        try:
-            bot.edit_message_text(
-                f"🗑️ Record `{file_name}` (User `{script_owner_id}`) and {deleted_str} deleted!",
-                chat_id_for_reply, call.message.message_id, reply_markup=None, parse_mode='Markdown'
-            )
-        except Exception as e:
-            logger.error(f"Error editing msg after delete: {e}")
-            bot.send_message(chat_id_for_reply, f"🗑️ Record `{file_name}` deleted.", parse_mode='Markdown')
-    except (ValueError, IndexError) as e:
-        logger.error(f"Error parsing delete callback '{call.data}': {e}")
-        bot.answer_callback_query(call.id, "Error: Invalid delete command.", show_alert=True)
-    except Exception as e:
-        logger.error(f"Error in delete_bot_callback for '{call.data}': {e}", exc_info=True)
-        bot.answer_callback_query(call.id, "Error deleting.", show_alert=True)
-
-def logs_bot_callback(call):
-    try:
-        _, script_owner_id_str, file_name = call.data.split('_', 2)
-        script_owner_id = int(script_owner_id_str)
-        requesting_user_id = call.from_user.id
-        chat_id_for_reply = call.message.chat.id
-
-        logger.info(f"Logs: Requester={requesting_user_id}, Owner={script_owner_id}, File='{file_name}'")
-        if not (requesting_user_id == script_owner_id or requesting_user_id in admin_ids):
-            bot.answer_callback_query(call.id, "⚠️ Permission denied.", show_alert=True); return
-
-        user_files_list = user_files.get(script_owner_id, [])
-        if not any(f[0] == file_name for f in user_files_list):
-            bot.answer_callback_query(call.id, "⚠️ File not found.", show_alert=True); check_files_callback(call); return
-
-        user_folder = get_user_folder(script_owner_id)
-        log_path = os.path.join(user_folder, f"{os.path.splitext(file_name)[0]}.log")
-        if not os.path.exists(log_path):
-            bot.answer_callback_query(call.id, f"⚠️ No logs for '{file_name}'.", show_alert=True); return
-
-        bot.answer_callback_query(call.id) 
-        try:
-            log_content = ""; file_size = os.path.getsize(log_path)
-            max_log_kb = 100; max_tg_msg = 4096
-            if file_size == 0: log_content = "(Log empty)"
-            elif file_size > max_log_kb * 1024:
-                 with open(log_path, 'rb') as f: f.seek(-max_log_kb * 1024, os.SEEK_END); log_bytes = f.read()
-                 log_content = log_bytes.decode('utf-8', errors='ignore')
-                 log_content = f"(Last {max_log_kb} KB)\n...\n" + log_content
-            else:
-                 with open(log_path, 'r', encoding='utf-8', errors='ignore') as f: log_content = f.read()
-
-            if len(log_content) > max_tg_msg:
-                log_content = log_content[-max_tg_msg:]
-                first_nl = log_content.find('\n')
-                if first_nl != -1: log_content = "...\n" + log_content[first_nl+1:]
-                else: log_content = "...\n" + log_content 
-            if not log_content.strip(): log_content = "(No visible content)"
-
-            bot.send_message(chat_id_for_reply, f"📜 Logs for `{file_name}` (User `{script_owner_id}`):\n```\n{log_content}\n```", parse_mode='Markdown')
-        except Exception as e:
-            logger.error(f"Error reading/sending log {log_path}: {e}", exc_info=True)
-            bot.send_message(chat_id_for_reply, f"❌ Error reading log for `{file_name}`.")
-    except (ValueError, IndexError) as e:
-        logger.error(f"Error parsing logs callback '{call.data}': {e}")
-        bot.answer_callback_query(call.id, "Error: Invalid logs command.", show_alert=True)
-    except Exception as e:
-        logger.error(f"Error in logs_bot_callback for '{call.data}': {e}", exc_info=True)
-        bot.answer_callback_query(call.id, "Error fetching logs.", show_alert=True)
-
-def speed_callback(call):
-    user_id = call.from_user.id
-    chat_id = call.message.chat.id
-    start_cb_ping_time = time.time() 
-    try:
-        bot.edit_message_text("🏃 Testing speed...", chat_id, call.message.message_id)
-        bot.send_chat_action(chat_id, 'typing') 
-        response_time = round((time.time() - start_cb_ping_time) * 1000, 2)
-        status = "🔓 Unlocked" if not bot_locked else "🔒 Locked"
-        # mode = "💰 Free Mode: ON" if free_mode else "💸 Free Mode: OFF" # Removed
-        if user_id == OWNER_ID: user_level = "👑 Owner"
-        elif user_id in admin_ids: user_level = "🛡️ Admin"
-        elif user_id in user_subscriptions and user_subscriptions[user_id].get('expiry', datetime.min) > datetime.now(): user_level = "⭐ Premium"
-        else: user_level = "🆓 Free User"
-        speed_msg = (f"⚡ Bot Speed & Status:\n\n⏱️ API Response Time: {response_time} ms\n"
-                     f"🚦 Bot Status: {status}\n"
-                     # f"模式 Mode: {mode}\n" # Removed
-                     f"👤 Your Level: {user_level}")
-        bot.answer_callback_query(call.id) 
-        bot.edit_message_text(speed_msg, chat_id, call.message.message_id, reply_markup=create_main_menu_inline(user_id))
-    except Exception as e:
-         logger.error(f"Error during speed test (cb): {e}", exc_info=True)
-         bot.answer_callback_query(call.id, "Error in speed test.", show_alert=True)
-         try: bot.edit_message_text("〽️ Main Menu", chat_id, call.message.message_id, reply_markup=create_main_menu_inline(user_id))
-         except Exception: pass
-
-def back_to_main_callback(call):
-    user_id = call.from_user.id
-    chat_id = call.message.chat.id
-    file_limit = get_user_file_limit(user_id)
-    current_files = get_user_file_count(user_id)
-    limit_str = str(file_limit) if file_limit != float('inf') else "Unlimited"
-    expiry_info = ""
-    if user_id == OWNER_ID: user_status = "👑 Owner"
-    elif user_id in admin_ids: user_status = "🛡️ Admin"
-    elif user_id in user_subscriptions:
-        expiry_date = user_subscriptions[user_id].get('expiry')
-        if expiry_date and expiry_date > datetime.now():
-            user_status = "⭐ Premium"; days_left = (expiry_date - datetime.now()).days
-            expiry_info = f"\n⏳ Subscription expires in: {days_left} days"
-        else: user_status = "🆓 Free User (Expired Sub)" # Will be cleaned up by welcome if not already
-    else: user_status = "🆓 Free User"
-    main_menu_text = (f"〽️ Welcome back, {call.from_user.first_name}!\n\n🆔 ID: `{user_id}`\n"
-                      f"🔰 Status: {user_status}{expiry_info}\n📁 Files: {current_files} / {limit_str}\n\n"
-                      f"👇 Use buttons or type commands.")
-    try:
-        bot.answer_callback_query(call.id)
-        bot.edit_message_text(main_menu_text, chat_id, call.message.message_id,
-                              reply_markup=create_main_menu_inline(user_id), parse_mode='Markdown')
-    except telebot.apihelper.ApiTelegramException as e:
-         if "message is not modified" in str(e): logger.warning("Msg not modified (back_to_main).")
-         else: logger.error(f"API error on back_to_main: {e}")
-    except Exception as e: logger.error(f"Error handling back_to_main: {e}", exc_info=True)
-
-# --- Admin Callback Implementations (for Inline Buttons) ---
-def subscription_management_callback(call):
-    bot.answer_callback_query(call.id)
-    try:
-        bot.edit_message_text("💳 Subscription Management\nSelect action:",
-                              call.message.chat.id, call.message.message_id, reply_markup=create_subscription_menu())
-    except Exception as e: logger.error(f"Error showing sub menu: {e}")
-
-def stats_callback(call): # Called by user and admin
-    bot.answer_callback_query(call.id)
-    # The logic is now inside _logic_statistics which determines what to show based on user_id
-    # We need to pass a message-like object to _logic_statistics
-    # For callbacks, call.message can be used.
-    _logic_statistics(call.message) 
-    # To update the inline keyboard after showing stats, we need to edit the message
-    try:
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id,
-                                      reply_markup=create_main_menu_inline(call.from_user.id))
-    except Exception as e:
-        logger.error(f"Error updating menu after stats_callback: {e}")
-
-
-def lock_bot_callback(call):
-    global bot_locked; bot_locked = True
-    logger.warning(f"Bot locked by Admin {call.from_user.id}")
-    bot.answer_callback_query(call.id, "🔒 Bot locked.")
-    try: bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=create_main_menu_inline(call.from_user.id))
-    except Exception as e: logger.error(f"Error updating menu (lock): {e}")
-
-def unlock_bot_callback(call):
-    global bot_locked; bot_locked = False
-    logger.warning(f"Bot unlocked by Admin {call.from_user.id}")
-    bot.answer_callback_query(call.id, "🔓 Bot unlocked.")
-    try: bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=create_main_menu_inline(call.from_user.id))
-    except Exception as e: logger.error(f"Error updating menu (unlock): {e}")
-
-# def toggle_free_mode_callback(call): # Removed
-#     pass
-
-def run_all_scripts_callback(call): # Added
-    _logic_run_all_scripts(call) # Pass the call object
-
-
-def broadcast_init_callback(call):
-    bot.answer_callback_query(call.id)
-    msg = bot.send_message(call.message.chat.id, "📢 Send message to broadcast.\n/cancel to abort.")
-    bot.register_next_step_handler(msg, process_broadcast_message)
-
-def process_broadcast_message(message):
-    user_id = message.from_user.id
-    if user_id not in admin_ids: bot.reply_to(message, "⚠️ Not authorized."); return
-    if message.text and message.text.lower() == '/cancel': bot.reply_to(message, "Broadcast cancelled."); return
-
-    broadcast_content = message.text # Can also handle photos, videos etc. if message.content_type is checked
-    if not broadcast_content and not (message.photo or message.video or message.document or message.sticker or message.voice or message.audio): # If no text and no other media
-         bot.reply_to(message, "⚠️ Cannot broadcast empty message. Send text or media, or /cancel.")
-         msg = bot.send_message(message.chat.id, "📢 Send broadcast message or /cancel.")
-         bot.register_next_step_handler(msg, process_broadcast_message)
-         return
-
-    target_count = len(active_users)
-    markup = types.InlineKeyboardMarkup()
-    markup.row(types.InlineKeyboardButton("✅ Confirm & Send", callback_data=f"confirm_broadcast_{message.message_id}"),
-               types.InlineKeyboardButton("❌ Cancel", callback_data="cancel_broadcast"))
-
-    preview_text = broadcast_content[:1000].strip() if broadcast_content else "(Media message)"
-    bot.reply_to(message, f"⚠️ Confirm Broadcast:\n\n```\n{preview_text}\n```\n" 
-                          f"To **{target_count}** users. Sure?", reply_markup=markup, parse_mode='Markdown')
-
-def handle_confirm_broadcast(call):
-    user_id = call.from_user.id
-    chat_id = call.message.chat.id
-    if user_id not in admin_ids: bot.answer_callback_query(call.id, "⚠️ Admin only.", show_alert=True); return
-    try:
-        original_message = call.message.reply_to_message
-        if not original_message: raise ValueError("Could not retrieve original message.")
-
-        # Check content type and get content
-        broadcast_text = None
-        broadcast_photo_id = None
-        broadcast_video_id = None
-        # Add other types as needed: document, sticker, voice, audio
-
-        if original_message.text:
-            broadcast_text = original_message.text
-        elif original_message.photo:
-            broadcast_photo_id = original_message.photo[-1].file_id # Get highest quality
-        elif original_message.video:
-            broadcast_video_id = original_message.video.file_id
-        # Add more elif for other content types
-        else:
-            raise ValueError("Message has no text or supported media for broadcast.")
-
-        bot.answer_callback_query(call.id, "🚀 Starting broadcast...")
-        bot.edit_message_text(f"📢 Broadcasting to {len(active_users)} users...",
-                              chat_id, call.message.message_id, reply_markup=None)
-        # Pass all potential content types to execute_broadcast
-        thread = threading.Thread(target=execute_broadcast, args=(
-            broadcast_text, broadcast_photo_id, broadcast_video_id, 
-            original_message.caption if (broadcast_photo_id or broadcast_video_id) else None, # Pass caption
-            chat_id))
-        thread.start()
-    except ValueError as ve: 
-        logger.error(f"Error retrieving msg for broadcast confirm: {ve}")
-        bot.edit_message_text(f"❌ Error starting broadcast: {ve}", chat_id, call.message.message_id, reply_markup=None)
-    except Exception as e:
-        logger.error(f"Error in handle_confirm_broadcast: {e}", exc_info=True)
-        bot.edit_message_text("❌ Unexpected error during broadcast confirm.", chat_id, call.message.message_id, reply_markup=None)
-
-def handle_cancel_broadcast(call):
-    bot.answer_callback_query(call.id, "Broadcast cancelled.")
-    bot.delete_message(call.message.chat.id, call.message.message_id)
-    # Optionally delete the original message too if call.message.reply_to_message exists
-    if call.message.reply_to_message:
-        try: bot.delete_message(call.message.chat.id, call.message.reply_to_message.message_id)
-        except: pass
-
-
-def execute_broadcast(broadcast_text, photo_id, video_id, caption, admin_chat_id):
-    sent_count = 0; failed_count = 0; blocked_count = 0
-    start_exec_time = time.time() 
-    users_to_broadcast = list(active_users); total_users = len(users_to_broadcast)
-    logger.info(f"Executing broadcast to {total_users} users.")
-    batch_size = 25; delay_batches = 1.5
-
-    for i, user_id_bc in enumerate(users_to_broadcast): # Renamed
-        try:
-            if broadcast_text:
-                bot.send_message(user_id_bc, broadcast_text, parse_mode='Markdown')
-            elif photo_id:
-                bot.send_photo(user_id_bc, photo_id, caption=caption, parse_mode='Markdown' if caption else None)
-            elif video_id:
-                bot.send_video(user_id_bc, video_id, caption=caption, parse_mode='Markdown' if caption else None)
-            # Add other send methods for other types
-            sent_count += 1
-        except telebot.apihelper.ApiTelegramException as e:
-            err_desc = str(e).lower()
-            if any(s in err_desc for s in ["bot was blocked", "user is deactivated", "chat not found", "kicked from", "restricted"]): 
-                logger.warning(f"Broadcast failed to {user_id_bc}: User blocked/inactive.")
-                blocked_count += 1
-            elif "flood control" in err_desc or "too many requests" in err_desc:
-                retry_after = 5; match = re.search(r"retry after (\d+)", err_desc)
-                if match: retry_after = int(match.group(1)) + 1 
-                logger.warning(f"Flood control. Sleeping {retry_after}s...")
-                time.sleep(retry_after)
-                try: # Retry once
-                    if broadcast_text: bot.send_message(user_id_bc, broadcast_text, parse_mode='Markdown')
-                    elif photo_id: bot.send_photo(user_id_bc, photo_id, caption=caption, parse_mode='Markdown' if caption else None)
-                    elif video_id: bot.send_video(user_id_bc, video_id, caption=caption, parse_mode='Markdown' if caption else None)
-                    sent_count += 1
-                except Exception as e_retry: logger.error(f"Broadcast retry failed to {user_id_bc}: {e_retry}"); failed_count +=1
-            else: logger.error(f"Broadcast failed to {user_id_bc}: {e}"); failed_count += 1
-        except Exception as e: logger.error(f"Unexpected error broadcasting to {user_id_bc}: {e}"); failed_count += 1
-
-        if (i + 1) % batch_size == 0 and i < total_users - 1:
-            logger.info(f"Broadcast batch {i//batch_size + 1} sent. Sleeping {delay_batches}s...")
-            time.sleep(delay_batches)
-        elif i % 5 == 0: time.sleep(0.2) 
-
-    duration = round(time.time() - start_exec_time, 2)
-    result_msg = (f"📢 Broadcast Complete!\n\n✅ Sent: {sent_count}\n❌ Failed: {failed_count}\n"
-                  f"🚫 Blocked/Inactive: {blocked_count}\n👥 Targets: {total_users}\n⏱️ Duration: {duration}s")
-    logger.info(result_msg)
-    try: bot.send_message(admin_chat_id, result_msg)
-    except Exception as e: logger.error(f"Failed to send broadcast result to admin {admin_chat_id}: {e}")
-
-def admin_panel_callback(call):
-    bot.answer_callback_query(call.id)
-    try:
-        bot.edit_message_text("👑 Admin Panel\nManage admins (Owner actions may be restricted).",
-                              call.message.chat.id, call.message.message_id, reply_markup=create_admin_panel())
-    except Exception as e: logger.error(f"Error showing admin panel: {e}")
-
-def add_admin_init_callback(call):
-    bot.answer_callback_query(call.id)
-    msg = bot.send_message(call.message.chat.id, "👑 Enter User ID to promote to Admin.\n/cancel to abort.")
-    bot.register_next_step_handler(msg, process_add_admin_id)
-
-def process_add_admin_id(message):
-    owner_id_check = message.from_user.id 
-    if owner_id_check != OWNER_ID: bot.reply_to(message, "⚠️ Owner only."); return
-    if message.text.lower() == '/cancel': bot.reply_to(message, "Admin promotion cancelled."); return
-    try:
-        new_admin_id = int(message.text.strip())
-        if new_admin_id <= 0: raise ValueError("ID must be positive")
-        if new_admin_id == OWNER_ID: bot.reply_to(message, "⚠️ Owner is already Owner."); return
-        if new_admin_id in admin_ids: bot.reply_to(message, f"⚠️ User `{new_admin_id}` already Admin."); return
-        add_admin_db(new_admin_id) 
-        logger.warning(f"Admin {new_admin_id} added by Owner {owner_id_check}.")
-        bot.reply_to(message, f"✅ User `{new_admin_id}` promoted to Admin.")
-        try: bot.send_message(new_admin_id, "🎉 Congrats! You are now an Admin.")
-        except Exception as e: logger.error(f"Failed to notify new admin {new_admin_id}: {e}")
-    except ValueError:
-        bot.reply_to(message, "⚠️ Invalid ID. Send numerical ID or /cancel.")
-        msg = bot.send_message(message.chat.id, "👑 Enter User ID to promote or /cancel.")
-        bot.register_next_step_handler(msg, process_add_admin_id)
-    except Exception as e: logger.error(f"Error processing add admin: {e}", exc_info=True); bot.reply_to(message, "Error.")
-
-def remove_admin_init_callback(call):
-    bot.answer_callback_query(call.id)
-    msg = bot.send_message(call.message.chat.id, "👑 Enter User ID of Admin to remove.\n/cancel to abort.")
-    bot.register_next_step_handler(msg, process_remove_admin_id)
-
-def process_remove_admin_id(message):
-    owner_id_check = message.from_user.id
-    if owner_id_check != OWNER_ID: bot.reply_to(message, "⚠️ Owner only."); return
-    if message.text.lower() == '/cancel': bot.reply_to(message, "Admin removal cancelled."); return
-    try:
-        admin_id_remove = int(message.text.strip()) # Renamed
-        if admin_id_remove <= 0: raise ValueError("ID must be positive")
-        if admin_id_remove == OWNER_ID: bot.reply_to(message, "⚠️ Owner cannot remove self."); return
-        if admin_id_remove not in admin_ids: bot.reply_to(message, f"⚠️ User `{admin_id_remove}` not Admin."); return
-        if remove_admin_db(admin_id_remove): 
-            logger.warning(f"Admin {admin_id_remove} removed by Owner {owner_id_check}.")
-            bot.reply_to(message, f"✅ Admin `{admin_id_remove}` removed.")
-            try: bot.send_message(admin_id_remove, "ℹ️ You are no longer an Admin.")
-            except Exception as e: logger.error(f"Failed to notify removed admin {admin_id_remove}: {e}")
-        else: bot.reply_to(message, f"❌ Failed to remove admin `{admin_id_remove}`. Check logs.")
-    except ValueError:
-        bot.reply_to(message, "⚠️ Invalid ID. Send numerical ID or /cancel.")
-        msg = bot.send_message(message.chat.id, "👑 Enter Admin ID to remove or /cancel.")
-        bot.register_next_step_handler(msg, process_remove_admin_id)
-    except Exception as e: logger.error(f"Error processing remove admin: {e}", exc_info=True); bot.reply_to(message, "Error.")
-
-def list_admins_callback(call):
-    bot.answer_callback_query(call.id)
-    try:
-        admin_list_str = "\n".join(f"- `{aid}` {'(Owner)' if aid == OWNER_ID else ''}" for aid in sorted(list(admin_ids)))
-        if not admin_list_str: admin_list_str = "(No Owner/Admins configured!)"
-        bot.edit_message_text(f"👑 Current Admins:\n\n{admin_list_str}", call.message.chat.id,
-                              call.message.message_id, reply_markup=create_admin_panel(), parse_mode='Markdown')
-    except Exception as e: logger.error(f"Error listing admins: {e}")
-
-def add_subscription_init_callback(call):
-    bot.answer_callback_query(call.id)
-    msg = bot.send_message(call.message.chat.id, "💳 Enter User ID & days (e.g., `12345678 30`).\n/cancel to abort.")
-    bot.register_next_step_handler(msg, process_add_subscription_details)
-
-def process_add_subscription_details(message):
-    admin_id_check = message.from_user.id 
-    if admin_id_check not in admin_ids: bot.reply_to(message, "⚠️ Not authorized."); return
-    if message.text.lower() == '/cancel': bot.reply_to(message, "Sub add cancelled."); return
-    try:
-        parts = message.text.split();
-        if len(parts) != 2: raise ValueError("Incorrect format")
-        sub_user_id = int(parts[0].strip()); days = int(parts[1].strip())
-        if sub_user_id <= 0 or days <= 0: raise ValueError("User ID/days must be positive")
-
-        current_expiry = user_subscriptions.get(sub_user_id, {}).get('expiry')
-        start_date_new_sub = datetime.now() # Renamed
-        if current_expiry and current_expiry > start_date_new_sub: start_date_new_sub = current_expiry
-        new_expiry = start_date_new_sub + timedelta(days=days)
-        save_subscription(sub_user_id, new_expiry)
-
-        logger.info(f"Sub for {sub_user_id} by admin {admin_id_check}. Expiry: {new_expiry:%Y-%m-%d}")
-        bot.reply_to(message, f"✅ Sub for `{sub_user_id}` by {days} days.\nNew expiry: {new_expiry:%Y-%m-%d}")
-        try: bot.send_message(sub_user_id, f"🎉 Sub activated/extended by {days} days! Expires: {new_expiry:%Y-%m-%d}.")
-        except Exception as e: logger.error(f"Failed to notify {sub_user_id} of new sub: {e}")
-    except ValueError as e:
-        bot.reply_to(message, f"⚠️ Invalid: {e}. Format: `ID days` or /cancel.")
-        msg = bot.send_message(message.chat.id, "💳 Enter User ID & days, or /cancel.")
-        bot.register_next_step_handler(msg, process_add_subscription_details)
-    except Exception as e: logger.error(f"Error processing add sub: {e}", exc_info=True); bot.reply_to(message, "Error.")
-
-def remove_subscription_init_callback(call):
-    bot.answer_callback_query(call.id)
-    msg = bot.send_message(call.message.chat.id, "💳 Enter User ID to remove sub.\n/cancel to abort.")
-    bot.register_next_step_handler(msg, process_remove_subscription_id)
-
-def process_remove_subscription_id(message):
-    admin_id_check = message.from_user.id
-    if admin_id_check not in admin_ids: bot.reply_to(message, "⚠️ Not authorized."); return
-    if message.text.lower() == '/cancel': bot.reply_to(message, "Sub removal cancelled."); return
-    try:
-        sub_user_id_remove = int(message.text.strip()) # Renamed
-        if sub_user_id_remove <= 0: raise ValueError("ID must be positive")
-        if sub_user_id_remove not in user_subscriptions:
-            bot.reply_to(message, f"⚠️ User `{sub_user_id_remove}` no active sub in memory."); return
-        remove_subscription_db(sub_user_id_remove) 
-        logger.warning(f"Sub removed for {sub_user_id_remove} by admin {admin_id_check}.")
-        bot.reply_to(message, f"✅ Sub for `{sub_user_id_remove}` removed.")
-        try: bot.send_message(sub_user_id_remove, "ℹ️ Your subscription removed by admin.")
-        except Exception as e: logger.error(f"Failed to notify {sub_user_id_remove} of sub removal: {e}")
-    except ValueError:
-        bot.reply_to(message, "⚠️ Invalid ID. Send numerical ID or /cancel.")
-        msg = bot.send_message(message.chat.id, "💳 Enter User ID to remove sub from, or /cancel.")
-        bot.register_next_step_handler(msg, process_remove_subscription_id)
-    except Exception as e: logger.error(f"Error processing remove sub: {e}", exc_info=True); bot.reply_to(message, "Error.")
-
-def check_subscription_init_callback(call):
-    bot.answer_callback_query(call.id)
-    msg = bot.send_message(call.message.chat.id, "💳 Enter User ID to check sub.\n/cancel to abort.")
-    bot.register_next_step_handler(msg, process_check_subscription_id)
-
-def process_check_subscription_id(message):
-    admin_id_check = message.from_user.id
-    if admin_id_check not in admin_ids: bot.reply_to(message, "⚠️ Not authorized."); return
-    if message.text.lower() == '/cancel': bot.reply_to(message, "Sub check cancelled."); return
-    try:
-        sub_user_id_check = int(message.text.strip()) # Renamed
-        if sub_user_id_check <= 0: raise ValueError("ID must be positive")
-        if sub_user_id_check in user_subscriptions:
-            expiry_dt = user_subscriptions[sub_user_id_check].get('expiry')
-            if expiry_dt:
-                if expiry_dt > datetime.now():
-                    days_left = (expiry_dt - datetime.now()).days
-                    bot.reply_to(message, f"✅ User `{sub_user_id_check}` active sub.\nExpires: {expiry_dt:%Y-%m-%d %H:%M:%S} ({days_left} days left).")
-                else:
-                    bot.reply_to(message, f"⚠️ User `{sub_user_id_check}` expired sub (On: {expiry_dt:%Y-%m-%d %H:%M:%S}).")
-                    remove_subscription_db(sub_user_id_check) # Clean up
-            else: bot.reply_to(message, f"⚠️ User `{sub_user_id_check}` in sub list, but expiry missing. Re-add if needed.")
-        else: bot.reply_to(message, f"ℹ️ User `{sub_user_id_check}` no active sub record.")
-    except ValueError:
-        bot.reply_to(message, "⚠️ Invalid ID. Send numerical ID or /cancel.")
-        msg = bot.send_message(message.chat.id, "💳 Enter User ID to check, or /cancel.")
-        bot.register_next_step_handler(msg, process_check_subscription_id)
-    except Exception as e: logger.error(f"Error processing check sub: {e}", exc_info=True); bot.reply_to(message, "Error.")
-
-# --- End Callback Query Handlers ---
-
-# --- Cleanup Function ---
-def cleanup():
-    logger.warning("Shutdown. Cleaning up processes...")
-    script_keys_to_stop = list(bot_scripts.keys()) 
-    if not script_keys_to_stop: logger.info("No scripts running. Exiting."); return
-    logger.info(f"Stopping {len(script_keys_to_stop)} scripts...")
-    for key in script_keys_to_stop:
-        if key in bot_scripts: logger.info(f"Stopping: {key}"); kill_process_tree(bot_scripts[key])
-        else: logger.info(f"Script {key} already removed.")
-    logger.warning("Cleanup finished.")
-atexit.register(cleanup)
-
-# --- Main Execution ---
-if __name__ == '__main__':
-    logger.info("="*40 + "\n🤖 Bot Starting Up...\n" + f"🐍 Python: {sys.version.split()[0]}\n" +
-                f"🔧 Base Dir: {BASE_DIR}\n📁 Upload Dir: {UPLOAD_BOTS_DIR}\n" +
-                f"📊 Data Dir: {IROTECH_DIR}\n🔑 Owner ID: {8252449932}\n🛡️ Admins: {admin_ids}\n" + "="*40)
-    keep_alive()
-    logger.info("🚀 Starting polling...")
-    while True:
-        try:
-            bot.infinity_polling(logger_level=logging.INFO, timeout=60, long_polling_timeout=30)
-        except requests.exceptions.ReadTimeout: logger.warning("Polling ReadTimeout. Restarting in 5s..."); time.sleep(5)
-        except requests.exceptions.ConnectionError as ce: logger.error(f"Polling ConnectionError: {ce}. Retrying in 15s..."); time.sleep(15)
-        except Exception as e:
-            logger.critical(f"💥 Unrecoverable polling error: {e}", exc_info=True)
-            logger.info("Restarting polling in 30s due to critical error..."); time.sleep(30)
-        finally: logger.warning("Polling attempt finished. Will restart if in loop."); time.sleep(1)
+IyAtKi0gY29kaW5nOiB1dGYtOCAtKi0KaW1wb3J0IHRlbGVib3QKaW1wb3J0
+IHN1YnByb2Nlc3MKaW1wb3J0IG9zCmltcG9ydCB6aXBmaWxlCmltcG9ydCB0
+ZW1wZmlsZQppbXBvcnQgc2h1dGlsCmZyb20gdGVsZWJvdCBpbXBvcnQgdHlw
+ZXMKaW1wb3J0IHRpbWUKZnJvbSBkYXRldGltZSBpbXBvcnQgZGF0ZXRpbWUs
+IHRpbWVkZWx0YQojIFJlbW92ZWQgdW51c2VkIHRlbGVncmFtLiogaW1wb3J0
+cyBhcyB3ZSBhcmUgdXNpbmcgdGVsZWJvdCBjb25zaXN0ZW50bHkKIyBmcm9t
+IHRlbGVncmFtIGltcG9ydCBVcGRhdGUKIyBmcm9tIHRlbGVncmFtLmV4dCBp
+bXBvcnQgVXBkYXRlciwgQ29tbWFuZEhhbmRsZXIsIENhbGxiYWNrQ29udGV4
+dAojIGltcG9ydCBwc3V0aWwKaW1wb3J0IHNxbGl0ZTMKaW1wb3J0IGpzb24g
+IyBLZXB0IGluIGNhc2UgbmVlZGVkIGVsc2V3aGVyZSwgYnV0IG5vdCB1c2Vk
+IGluIHByb3ZpZGVkIGxvZ2ljCmltcG9ydCBsb2dnaW5nICMgS2VwdCBpbiBj
+YXNlIG5lZWRlZCBlbHNld2hlcmUKaW1wb3J0IHNpZ25hbCAjIEtlcHQgaW4g
+Y2FzZSBuZWVkZWQgZWxzZXdoZXJlCmltcG9ydCB0aHJlYWRpbmcKaW1wb3J0
+IHJlICMgQWRkZWQgZm9yIHJlZ2V4IG1hdGNoaW5nIGluIGF1dG8taW5zdGFs
+bAppbXBvcnQgc3lzICMgQWRkZWQgZm9yIHN5cy5leGVjdXRhYmxlCmltcG9y
+dCBhdGV4aXQKaW1wb3J0IHJlcXVlc3RzICMgRm9yIHBvbGxpbmcgZXhjZXB0
+aW9ucwoKIyAtLS0gRmxhc2sgS2VlcCBBbGl2ZSAtLS0KZnJvbSBmbGFzayBp
+bXBvcnQgRmxhc2sKZnJvbSB0aHJlYWRpbmcgaW1wb3J0IFRocmVhZAoKYXBw
+ID0gRmxhc2soJycpCgpAYXBwLnJvdXRlKCcvJykKZGVmIGhvbWUoKToKICAg
+IHJldHVybiAiSSdhbSBNYXJjbyBGaWxlIEhvc3QiCgpkZWYgcnVuX2ZsYXNr
+KCk6CiAgIyBNYWtlIHN1cmUgdG8gcnVuIG9uIHBvcnQgcHJvdmlkZWQgYnkg
+ZW52aXJvbm1lbnQgb3IgZGVmYXVsdCB0byA4MDgwCiAgcG9ydCA9IGludChv
+cy5lbnZpcm9uLmdldCgiUE9SVCIsIDgwODApKQogIGFwcC5ydW4oaG9zdD0n
+MC4wLjAuMCcsIHBvcnQ9cG9ydCkKCmRlZiBrZWVwX2FsaXZlKCk6CiAgICB0
+ID0gVGhyZWFkKHRhcmdldD1ydW5fZmxhc2spCiAgICB0LmRhZW1vbiA9IFRy
+dWUgIyBBbGxvd3MgcHJvZ3JhbSB0byBleGl0IGV2ZW4gaWYgdGhpcyB0aHJl
+YWQgaXMgcnVubmluZwogICAgdC5zdGFydCgpCiAgICBwcmludCgiRmxhc2sg
+S2VlcC1BbGl2ZSBzZXJ2ZXIgc3RhcnRlZC4iKQojIC0tLSBFbmQgRmxhc2sg
+S2VlcCBBbGl2ZSAtLS0KCiMgLS0tIENvbmZpZ3VyYXRpb24gLS0tClRPS0VO
+ID0gJzg3MTAwMDM0Njg6QUFGb3U2RU9NRGYwTDd0cjJjSWQzSzJkd0RiUi02
+QWZRWE0nICMgUmVwbGFjZSB3aXRoIHlvdXIgYWN0dWFsIHRva2VuCk9XTkVS
+X0lEID0gODQzODk1MjI4MyAjIFJlcGxhY2Ugd2l0aCB5b3VyIE93bmVyIElE
+CkFETUlOX0lEID0gODQzODk1MjI4MyAjIFJlcGxhY2Ugd2l0aCB5b3VyIEFk
+bWluIElEIChjYW4gYmUgc2FtZSBhcyBPd25lcikKWU9VUl9VU0VSTkFNRSA9
+ICdAZGV2ZWxvcGVydGluZXNoZXJhJyAjIFJlcGxhY2Ugd2l0aCB5b3VyIFRl
+bGVncmFtIHVzZXJuYW1lICh3aXRob3V0IHRoZSBAKQpVUERBVEVfQ0hBTk5F
+TCA9ICd0Lm1lL0ByZXZlcnNlYnlwYXNzMDEnICMgUmVwbGFjZSB3aXRoIHlv
+dXIgdXBkYXRlIGNoYW5uZWwgbGluawoKIyBGb2xkZXIgc2V0dXAgLSB1c2lu
+ZyBhYnNvbHV0ZSBwYXRocwpCQVNFX0RJUiA9IG9zLnBhdGguYWJzcGF0aChv
+cy5wYXRoLmRpcm5hbWUoX19maWxlX18pKSAjIEdldCBzY3JpcHQncyBkaXJl
+Y3RvcnkKVVBMT0FEX0JPVFNfRElSID0gb3MucGF0aC5qb2luKEJBU0VfRElS
+LCAndXBsb2FkX2JvdHMnKQpJUk9URUNIX0RJUiA9IG9zLnBhdGguam9pbihC
+QVNFX0RJUiwgJ2luZicpICMgQXNzdW1pbmcgdGhpcyBuYW1lIGlzIGludGVu
+dGlvbmFsCkRBVEFCQVNFX1BBVEggPSBvcy5wYXRoLmpvaW4oSVJPVEVDSF9E
+SVIsICdib3RfZGF0YS5kYicpCgojIEZpbGUgdXBsb2FkIGxpbWl0cwpGUkVF
+X1VTRVJfTElNSVQgPSAxMApTVUJTQ1JJQkVEX1VTRVJfTElNSVQgPSAxNSAj
+IENoYW5nZWQgZnJvbSAxMCB0byAxNQpBRE1JTl9MSU1JVCA9IDk5OSAgICAg
+ICAjIENoYW5nZWQgZnJvbSA1MCB0byA5OTkKT1dORVJfTElNSVQgPSBmbG9h
+dCgnaW5mJykgIyBDaGFuZ2VkIGZyb20gOTk5IHRvIGluZmluaXR5CiMgRlJF
+RV9NT0RFX0xJTUlUID0gMyAjIFJlbW92ZWQgYXMgZnJlZV9tb2RlIGlzIHJl
+bW92ZWQKCiMgQ3JlYXRlIG5lY2Vzc2FyeSBkaXJlY3Rvcmllcwpvcy5tYWtl
+ZGlycyhVUExPQURfQk9UU19ESVIsIGV4aXN0X29rPVRydWUpCm9zLm1ha2Vk
+aXJzKElST1RFQ0hfRElSLCBleGlzdF9vaz1UcnVlKQoKIyBJbml0aWFsaXpl
+IGJvdApib3QgPSB0ZWxlYm90LlRlbGVCb3QoVE9LRU4pCgojIC0tLSBEYXRh
+IHN0cnVjdHVyZXMgLS0tCmJvdF9zY3JpcHRzID0ge30gIyBTdG9yZXMgaW5m
+byBhYm91dCBydW5uaW5nIHNjcmlwdHMge3NjcmlwdF9rZXk6IGluZm9fZGlj
+dH0KdXNlcl9zdWJzY3JpcHRpb25zID0ge30gIyB7dXNlcl9pZDogeydleHBp
+cnknOiBkYXRldGltZV9vYmplY3R9fQp1c2VyX2ZpbGVzID0ge30gIyB7dXNl
+cl9pZDogWyhmaWxlX25hbWUsIGZpbGVfdHlwZSksIC4uLl19CmFjdGl2ZV91
+c2VycyA9IHNldCgpICMgU2V0IG9mIGFsbCB1c2VyIElEcyB0aGF0IGhhdmUg
+aW50ZXJhY3RlZCB3aXRoIHRoZSBib3QKYWRtaW5faWRzID0ge0FETUlOX0lE
+LCBPV05FUl9JRH0gIyBTZXQgb2YgYWRtaW4gSURzCmJvdF9sb2NrZWQgPSBG
+YWxzZQojIGZyZWVfbW9kZSA9IEZhbHNlICMgUmVtb3ZlZCBmcmVlX21vZGUK
+CiMgLS0tIExvZ2dpbmcgU2V0dXAgLS0tCiMgQ29uZmlndXJlIGJhc2ljIGxv
+Z2dpbmcKbG9nZ2luZy5iYXNpY0NvbmZpZyhsZXZlbD1sb2dnaW5nLklORk8s
+CiAgICAgICAgICAgICAgICAgICAgZm9ybWF0PSclKGFzY3RpbWUpcyAtICUo
+bmFtZSlzIC0gJShsZXZlbG5hbWUpcyAtICUobWVzc2FnZSlzJykKbG9nZ2Vy
+ID0gbG9nZ2luZy5nZXRMb2dnZXIoX19uYW1lX18pCgojIC0tLSBDb21tYW5k
+IEJ1dHRvbiBMYXlvdXRzIChSZXBseUtleWJvYXJkTWFya3VwKSAtLS0KQ09N
+TUFORF9CVVRUT05TX0xBWU9VVF9VU0VSX1NQRUMgPSBbCiAgICBbIvCfk6Ig
+VXBkYXRlcyBDaGFubmVsIl0sCiAgICBbIvCfk6QgVXBsb2FkIEZpbGUiLCAi
+8J+TgiBDaGVjayBGaWxlcyJdLAogICAgWyLimqEgQm90IFNwZWVkIiwgIvCf
+k4ogU3RhdGlzdGljcyJdLCAjIFN0YXRpc3RpY3MgYnV0dG9uIGtlcHQgZm9y
+IHVzZXJzLCBsb2dpYyB3aWxsIHJlc3RyaWN0IGlmIG5vdCBhZG1pbgogICAg
+WyLwn5OeIENvbnRhY3QgT3duZXIiXQpdCkFETUlOX0NPTU1BTkRfQlVUVE9O
+U19MQVlPVVRfVVNFUl9TUEVDID0gWwogICAgWyLwn5OiIFVwZGF0ZXMgQ2hh
+bm5lbCJdLAogICAgWyLwn5OkIFVwbG9hZCBGaWxlIiwgIvCfk4IgQ2hlY2sg
+RmlsZXMiXSwKICAgIFsi4pqhIEJvdCBTcGVlZCIsICLwn5OKIFN0YXRpc3Rp
+Y3MiXSwKICAgIFsi8J+SsyBTdWJzY3JpcHRpb25zIiwgIvCfk6IgQnJvYWRj
+YXN0Il0sCiAgICBbIvCflJIgTG9jayBCb3QiLCAi8J+foiBSdW5uaW5nIEFs
+bCBDb2RlIl0sICMgQ2hhbmdlZCAiRnJlZSBNb2RlIiB0byAiUnVubmluZyBB
+bGwgQ29kZSIKICAgIFsi8J+RkSBBZG1pbiBQYW5lbCIsICLwn5OeIENvbnRh
+Y3QgT3duZXIiXQpdCgojIC0tLSBEYXRhYmFzZSBTZXR1cCAtLS0KZGVmIGlu
+aXRfZGIoKToKICAgICIiIkluaXRpYWxpemUgdGhlIGRhdGFiYXNlIHdpdGgg
+cmVxdWlyZWQgdGFibGVzIiIiCiAgICBsb2dnZXIuaW5mbyhmIkluaXRpYWxp
+emluZyBkYXRhYmFzZSBhdDoge0RBVEFCQVNFX1BBVEh9IikKICAgIHRyeToK
+ICAgICAgICBjb25uID0gc3FsaXRlMy5jb25uZWN0KERBVEFCQVNFX1BBVEgs
+IGNoZWNrX3NhbWVfdGhyZWFkPUZhbHNlKSAjIEFsbG93IGFjY2VzcyBmcm9t
+IG11bHRpcGxlIHRocmVhZHMKICAgICAgICBjID0gY29ubi5jdXJzb3IoKQog
+ICAgICAgIGMuZXhlY3V0ZSgnJydDUkVBVEUgVEFCTEUgSUYgTk9UIEVYSVNU
+UyBzdWJzY3JpcHRpb25zCiAgICAgICAgICAgICAgICAgICAgICh1c2VyX2lk
+IElOVEVHRVIgUFJJTUFSWSBLRVksIGV4cGlyeSBURVhUKScnJykKICAgICAg
+ICBjLmV4ZWN1dGUoJycnQ1JFQVRFIFRBQkxFIElGIE5PVCBFWElTVFMgdXNl
+cl9maWxlcwogICAgICAgICAgICAgICAgICAgICAodXNlcl9pZCBJTlRFR0VS
+LCBmaWxlX25hbWUgVEVYVCwgZmlsZV90eXBlIFRFWFQsCiAgICAgICAgICAg
+ICAgICAgICAgICBQUklNQVJZIEtFWSAodXNlcl9pZCwgZmlsZV9uYW1lKSkn
+JycpCiAgICAgICAgYy5leGVjdXRlKCcnJ0NSRUFURSBUQUJMRSBJRiBOT1Qg
+RVhJU1RTIGFjdGl2ZV91c2VycwogICAgICAgICAgICAgICAgICAgICAodXNl
+cl9pZCBJTlRFR0VSIFBSSU1BUlkgS0VZKScnJykKICAgICAgICBjLmV4ZWN1
+dGUoJycnQ1JFQVRFIFRBQkxFIElGIE5PVCBFWElTVFMgYWRtaW5zCiAgICAg
+ICAgICAgICAgICAgICAgICh1c2VyX2lkIElOVEVHRVIgUFJJTUFSWSBLRVkp
+JycnKSAjIEFkZGVkIGFkbWlucyB0YWJsZQogICAgICAgICMgRW5zdXJlIG93
+bmVyIGFuZCBpbml0aWFsIGFkbWluIGFyZSBpbiBhZG1pbnMgdGFibGUKICAg
+ICAgICBjLmV4ZWN1dGUoJ0lOU0VSVCBPUiBJR05PUkUgSU5UTyBhZG1pbnMg
+KHVzZXJfaWQpIFZBTFVFUyAoPyknLCAoT1dORVJfSUQsKSkKICAgICAgICBp
+ZiBBRE1JTl9JRCAhPSBPV05FUl9JRDoKICAgICAgICAgICAgIGMuZXhlY3V0
+ZSgnSU5TRVJUIE9SIElHTk9SRSBJTlRPIGFkbWlucyAodXNlcl9pZCkgVkFM
+VUVTICg/KScsIChBRE1JTl9JRCwpKQogICAgICAgIGNvbm4uY29tbWl0KCkK
+ICAgICAgICBjb25uLmNsb3NlKCkKICAgICAgICBsb2dnZXIuaW5mbygiRGF0
+YWJhc2UgaW5pdGlhbGl6ZWQgc3VjY2Vzc2Z1bGx5LiIpCiAgICBleGNlcHQg
+RXhjZXB0aW9uIGFzIGU6CiAgICAgICAgbG9nZ2VyLmVycm9yKGYi4p2MIERh
+dGFiYXNlIGluaXRpYWxpemF0aW9uIGVycm9yOiB7ZX0iLCBleGNfaW5mbz1U
+cnVlKQoKZGVmIGxvYWRfZGF0YSgpOgogICAgIiIiTG9hZCBkYXRhIGZyb20g
+ZGF0YWJhc2UgaW50byBtZW1vcnkiIiIKICAgIGxvZ2dlci5pbmZvKCJMb2Fk
+aW5nIGRhdGEgZnJvbSBkYXRhYmFzZS4uLiIpCiAgICB0cnk6CiAgICAgICAg
+Y29ubiA9IHNxbGl0ZTMuY29ubmVjdChEQVRBQkFTRV9QQVRILCBjaGVja19z
+YW1lX3RocmVhZD1GYWxzZSkKICAgICAgICBjID0gY29ubi5jdXJzb3IoKQoK
+ICAgICAgICAjIExvYWQgc3Vic2NyaXB0aW9ucwogICAgICAgIGMuZXhlY3V0
+ZSgnU0VMRUNUIHVzZXJfaWQsIGV4cGlyeSBGUk9NIHN1YnNjcmlwdGlvbnMn
+KQogICAgICAgIGZvciB1c2VyX2lkLCBleHBpcnkgaW4gYy5mZXRjaGFsbCgp
+OgogICAgICAgICAgICB0cnk6CiAgICAgICAgICAgICAgICB1c2VyX3N1YnNj
+cmlwdGlvbnNbdXNlcl9pZF0gPSB7J2V4cGlyeSc6IGRhdGV0aW1lLmZyb21p
+c29mb3JtYXQoZXhwaXJ5KX0KICAgICAgICAgICAgZXhjZXB0IFZhbHVlRXJy
+b3I6CiAgICAgICAgICAgICAgICBsb2dnZXIud2FybmluZyhmIuKaoO+4jyBJ
+bnZhbGlkIGV4cGlyeSBkYXRlIGZvcm1hdCBmb3IgdXNlciB7dXNlcl9pZH06
+IHtleHBpcnl9LiBTa2lwcGluZy4iKQoKICAgICAgICAjIExvYWQgdXNlciBm
+aWxlcwogICAgICAgIGMuZXhlY3V0ZSgnU0VMRUNUIHVzZXJfaWQsIGZpbGVf
+bmFtZSwgZmlsZV90eXBlIEZST00gdXNlcl9maWxlcycpCiAgICAgICAgZm9y
+IHVzZXJfaWQsIGZpbGVfbmFtZSwgZmlsZV90eXBlIGluIGMuZmV0Y2hhbGwo
+KToKICAgICAgICAgICAgaWYgdXNlcl9pZCBub3QgaW4gdXNlcl9maWxlczoK
+ICAgICAgICAgICAgICAgIHVzZXJfZmlsZXNbdXNlcl9pZF0gPSBbXQogICAg
+ICAgICAgICB1c2VyX2ZpbGVzW3VzZXJfaWRdLmFwcGVuZCgoZmlsZV9uYW1l
+LCBmaWxlX3R5cGUpKQoKICAgICAgICAjIExvYWQgYWN0aXZlIHVzZXJzCiAg
+ICAgICAgYy5leGVjdXRlKCdTRUxFQ1QgdXNlcl9pZCBGUk9NIGFjdGl2ZV91
+c2VycycpCiAgICAgICAgYWN0aXZlX3VzZXJzLnVwZGF0ZSh1c2VyX2lkIGZv
+ciAodXNlcl9pZCwpIGluIGMuZmV0Y2hhbGwoKSkKCiAgICAgICAgIyBMb2Fk
+IGFkbWlucwogICAgICAgIGMuZXhlY3V0ZSgnU0VMRUNUIHVzZXJfaWQgRlJP
+TSBhZG1pbnMnKQogICAgICAgIGFkbWluX2lkcy51cGRhdGUodXNlcl9pZCBm
+b3IgKHVzZXJfaWQsKSBpbiBjLmZldGNoYWxsKCkpICMgTG9hZCBhZG1pbnMg
+aW50byB0aGUgc2V0CgogICAgICAgIGNvbm4uY2xvc2UoKQogICAgICAgIGxv
+Z2dlci5pbmZvKGYiRGF0YSBsb2FkZWQ6IHtsZW4oYWN0aXZlX3VzZXJzKX0g
+dXNlcnMsIHtsZW4odXNlcl9zdWJzY3JpcHRpb25zKX0gc3Vic2NyaXB0aW9u
+cywge2xlbihhZG1pbl9pZHMpfSBhZG1pbnMuIikKICAgIGV4Y2VwdCBFeGNl
+cHRpb24gYXMgZToKICAgICAgICBsb2dnZXIuZXJyb3IoZiLinYwgRXJyb3Ig
+bG9hZGluZyBkYXRhOiB7ZX0iLCBleGNfaW5mbz1UcnVlKQoKIyBJbml0aWFs
+aXplIERCIGFuZCBMb2FkIERhdGEgYXQgc3RhcnR1cAppbml0X2RiKCkKbG9h
+ZF9kYXRhKCkKIyAtLS0gRW5kIERhdGFiYXNlIFNldHVwIC0tLQoKIyAtLS0g
+SGVscGVyIEZ1bmN0aW9ucyAtLS0KZGVmIGdldF91c2VyX2ZvbGRlcih1c2Vy
+X2lkKToKICAgICIiIkdldCBvciBjcmVhdGUgdXNlcidzIGZvbGRlciBmb3Ig
+c3RvcmluZyBmaWxlcyIiIgogICAgdXNlcl9mb2xkZXIgPSBvcy5wYXRoLmpv
+aW4oVVBMT0FEX0JPVFNfRElSLCBzdHIodXNlcl9pZCkpCiAgICBvcy5tYWtl
+ZGlycyh1c2VyX2ZvbGRlciwgZXhpc3Rfb2s9VHJ1ZSkKICAgIHJldHVybiB1
+c2VyX2ZvbGRlcgoKZGVmIGdldF91c2VyX2ZpbGVfbGltaXQodXNlcl9pZCk6
+CiAgICAiIiJHZXQgdGhlIGZpbGUgdXBsb2FkIGxpbWl0IGZvciBhIHVzZXIi
+IiIKICAgICMgaWYgZnJlZV9tb2RlOiByZXR1cm4gRlJFRV9NT0RFX0xJTUlU
+ICMgUmVtb3ZlZCBmcmVlX21vZGUgY2hlY2sKICAgIGlmIHVzZXJfaWQgPT0g
+T1dORVJfSUQ6IHJldHVybiBPV05FUl9MSU1JVAogICAgaWYgdXNlcl9pZCBp
+biBhZG1pbl9pZHM6IHJldHVybiBBRE1JTl9MSU1JVAogICAgaWYgdXNlcl9p
+ZCBpbiB1c2VyX3N1YnNjcmlwdGlvbnMgYW5kIHVzZXJfc3Vic2NyaXB0aW9u
+c1t1c2VyX2lkXVsnZXhwaXJ5J10gPiBkYXRldGltZS5ub3coKToKICAgICAg
+ICByZXR1cm4gU1VCU0NSSUJFRF9VU0VSX0xJTUlUCiAgICByZXR1cm4gRlJF
+RV9VU0VSX0xJTUlUCgpkZWYgZ2V0X3VzZXJfZmlsZV9jb3VudCh1c2VyX2lk
+KToKICAgICIiIkdldCB0aGUgbnVtYmVyIG9mIGZpbGVzIHVwbG9hZGVkIGJ5
+IGEgdXNlciIiIgogICAgcmV0dXJuIGxlbih1c2VyX2ZpbGVzLmdldCh1c2Vy
+X2lkLCBbXSkpCgpkZWYgaXNfYm90X3J1bm5pbmcoc2NyaXB0X293bmVyX2lk
+LCBmaWxlX25hbWUpOiAjIFBhcmFtZXRlciByZW5hbWVkIGZvciBjbGFyaXR5
+CiAgICAiIiJDaGVjayBpZiBhIGJvdCBzY3JpcHQgaXMgY3VycmVudGx5IHJ1
+bm5pbmcgZm9yIGEgc3BlY2lmaWMgdXNlciIiIgogICAgc2NyaXB0X2tleSA9
+IGYie3NjcmlwdF9vd25lcl9pZH1fe2ZpbGVfbmFtZX0iICMgS2V5IHVzZXMg
+c2NyaXB0X293bmVyX2lkCiAgICBzY3JpcHRfaW5mbyA9IGJvdF9zY3JpcHRz
+LmdldChzY3JpcHRfa2V5KQogICAgaWYgc2NyaXB0X2luZm8gYW5kIHNjcmlw
+dF9pbmZvLmdldCgncHJvY2VzcycpOgogICAgICAgIHRyeToKICAgICAgICAg
+ICAgcHJvYyA9IHBzdXRpbC5Qcm9jZXNzKHNjcmlwdF9pbmZvWydwcm9jZXNz
+J10ucGlkKQogICAgICAgICAgICBpc19ydW5uaW5nID0gcHJvYy5pc19ydW5u
+aW5nKCkgYW5kIHByb2Muc3RhdHVzKCkgIT0gcHN1dGlsLlNUQVRVU19aT01C
+SUUKICAgICAgICAgICAgaWYgbm90IGlzX3J1bm5pbmc6CiAgICAgICAgICAg
+ICAgICBsb2dnZXIud2FybmluZyhmIlByb2Nlc3Mge3NjcmlwdF9pbmZvWydw
+cm9jZXNzJ10ucGlkfSBmb3Ige3NjcmlwdF9rZXl9IGZvdW5kIGluIG1lbW9y
+eSBidXQgbm90IHJ1bm5pbmcvem9tYmllLiBDbGVhbmluZyB1cC4iKQogICAg
+ICAgICAgICAgICAgaWYgJ2xvZ19maWxlJyBpbiBzY3JpcHRfaW5mbyBhbmQg
+aGFzYXR0cihzY3JpcHRfaW5mb1snbG9nX2ZpbGUnXSwgJ2Nsb3NlJykgYW5k
+IG5vdCBzY3JpcHRfaW5mb1snbG9nX2ZpbGUnXS5jbG9zZWQ6CiAgICAgICAg
+ICAgICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgICAgICAgICBzY3Jp
+cHRfaW5mb1snbG9nX2ZpbGUnXS5jbG9zZSgpCiAgICAgICAgICAgICAgICAg
+ICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBsb2dfZToKICAgICAgICAgICAgICAg
+ICAgICAgICAgbG9nZ2VyLmVycm9yKGYiRXJyb3IgY2xvc2luZyBsb2cgZmls
+ZSBkdXJpbmcgem9tYmllIGNsZWFudXAge3NjcmlwdF9rZXl9OiB7bG9nX2V9
+IikKICAgICAgICAgICAgICAgIGlmIHNjcmlwdF9rZXkgaW4gYm90X3Njcmlw
+dHM6CiAgICAgICAgICAgICAgICAgICAgZGVsIGJvdF9zY3JpcHRzW3Njcmlw
+dF9rZXldCiAgICAgICAgICAgIHJldHVybiBpc19ydW5uaW5nCiAgICAgICAg
+ZXhjZXB0IHBzdXRpbC5Ob1N1Y2hQcm9jZXNzOgogICAgICAgICAgICBsb2dn
+ZXIud2FybmluZyhmIlByb2Nlc3MgZm9yIHtzY3JpcHRfa2V5fSBub3QgZm91
+bmQgKE5vU3VjaFByb2Nlc3MpLiBDbGVhbmluZyB1cC4iKQogICAgICAgICAg
+ICBpZiAnbG9nX2ZpbGUnIGluIHNjcmlwdF9pbmZvIGFuZCBoYXNhdHRyKHNj
+cmlwdF9pbmZvWydsb2dfZmlsZSddLCAnY2xvc2UnKSBhbmQgbm90IHNjcmlw
+dF9pbmZvWydsb2dfZmlsZSddLmNsb3NlZDoKICAgICAgICAgICAgICAgIHRy
+eToKICAgICAgICAgICAgICAgICAgICAgc2NyaXB0X2luZm9bJ2xvZ19maWxl
+J10uY2xvc2UoKQogICAgICAgICAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbiBh
+cyBsb2dfZToKICAgICAgICAgICAgICAgICAgICAgbG9nZ2VyLmVycm9yKGYi
+RXJyb3IgY2xvc2luZyBsb2cgZmlsZSBkdXJpbmcgY2xlYW51cCBvZiBub24t
+ZXhpc3RlbnQgcHJvY2VzcyB7c2NyaXB0X2tleX06IHtsb2dfZX0iKQogICAg
+ICAgICAgICBpZiBzY3JpcHRfa2V5IGluIGJvdF9zY3JpcHRzOgogICAgICAg
+ICAgICAgICAgIGRlbCBib3Rfc2NyaXB0c1tzY3JpcHRfa2V5XQogICAgICAg
+ICAgICByZXR1cm4gRmFsc2UKICAgICAgICBleGNlcHQgRXhjZXB0aW9uIGFz
+IGU6CiAgICAgICAgICAgIGxvZ2dlci5lcnJvcihmIkVycm9yIGNoZWNraW5n
+IHByb2Nlc3Mgc3RhdHVzIGZvciB7c2NyaXB0X2tleX06IHtlfSIsIGV4Y19p
+bmZvPVRydWUpCiAgICAgICAgICAgIHJldHVybiBGYWxzZQogICAgcmV0dXJu
+IEZhbHNlCgoKZGVmIGtpbGxfcHJvY2Vzc190cmVlKHByb2Nlc3NfaW5mbyk6
+CiAgICAiIiJLaWxsIGEgcHJvY2VzcyBhbmQgYWxsIGl0cyBjaGlsZHJlbiwg
+ZW5zdXJpbmcgbG9nIGZpbGUgaXMgY2xvc2VkLiIiIgogICAgcGlkID0gTm9u
+ZQogICAgbG9nX2ZpbGVfY2xvc2VkID0gRmFsc2UKICAgIHNjcmlwdF9rZXkg
+PSBwcm9jZXNzX2luZm8uZ2V0KCdzY3JpcHRfa2V5JywgJ04vQScpIAoKICAg
+IHRyeToKICAgICAgICBpZiAnbG9nX2ZpbGUnIGluIHByb2Nlc3NfaW5mbyBh
+bmQgaGFzYXR0cihwcm9jZXNzX2luZm9bJ2xvZ19maWxlJ10sICdjbG9zZScp
+IGFuZCBub3QgcHJvY2Vzc19pbmZvWydsb2dfZmlsZSddLmNsb3NlZDoKICAg
+ICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgcHJvY2Vzc19pbmZvWyds
+b2dfZmlsZSddLmNsb3NlKCkKICAgICAgICAgICAgICAgIGxvZ19maWxlX2Ns
+b3NlZCA9IFRydWUKICAgICAgICAgICAgICAgIGxvZ2dlci5pbmZvKGYiQ2xv
+c2VkIGxvZyBmaWxlIGZvciB7c2NyaXB0X2tleX0gKFBJRDoge3Byb2Nlc3Nf
+aW5mby5nZXQoJ3Byb2Nlc3MnLCB7fSkuZ2V0KCdwaWQnLCAnTi9BJyl9KSIp
+CiAgICAgICAgICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgbG9nX2U6CiAgICAg
+ICAgICAgICAgICBsb2dnZXIuZXJyb3IoZiJFcnJvciBjbG9zaW5nIGxvZyBm
+aWxlIGR1cmluZyBraWxsIGZvciB7c2NyaXB0X2tleX06IHtsb2dfZX0iKQoK
+ICAgICAgICBwcm9jZXNzID0gcHJvY2Vzc19pbmZvLmdldCgncHJvY2Vzcycp
+CiAgICAgICAgaWYgcHJvY2VzcyBhbmQgaGFzYXR0cihwcm9jZXNzLCAncGlk
+Jyk6CiAgICAgICAgICAgcGlkID0gcHJvY2Vzcy5waWQKICAgICAgICAgICBp
+ZiBwaWQ6IAogICAgICAgICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAg
+ICAgIHBhcmVudCA9IHBzdXRpbC5Qcm9jZXNzKHBpZCkKICAgICAgICAgICAg
+ICAgICAgICBjaGlsZHJlbiA9IHBhcmVudC5jaGlsZHJlbihyZWN1cnNpdmU9
+VHJ1ZSkKICAgICAgICAgICAgICAgICAgICBsb2dnZXIuaW5mbyhmIkF0dGVt
+cHRpbmcgdG8ga2lsbCBwcm9jZXNzIHRyZWUgZm9yIHtzY3JpcHRfa2V5fSAo
+UElEOiB7cGlkfSwgQ2hpbGRyZW46IHtbYy5waWQgZm9yIGMgaW4gY2hpbGRy
+ZW5dfSkiKQoKICAgICAgICAgICAgICAgICAgICBmb3IgY2hpbGQgaW4gY2hp
+bGRyZW46CiAgICAgICAgICAgICAgICAgICAgICAgIHRyeToKICAgICAgICAg
+ICAgICAgICAgICAgICAgICAgIGNoaWxkLnRlcm1pbmF0ZSgpCiAgICAgICAg
+ICAgICAgICAgICAgICAgICAgICBsb2dnZXIuaW5mbyhmIlRlcm1pbmF0ZWQg
+Y2hpbGQgcHJvY2VzcyB7Y2hpbGQucGlkfSBmb3Ige3NjcmlwdF9rZXl9IikK
+ICAgICAgICAgICAgICAgICAgICAgICAgZXhjZXB0IHBzdXRpbC5Ob1N1Y2hQ
+cm9jZXNzOgogICAgICAgICAgICAgICAgICAgICAgICAgICAgbG9nZ2VyLndh
+cm5pbmcoZiJDaGlsZCBwcm9jZXNzIHtjaGlsZC5waWR9IGZvciB7c2NyaXB0
+X2tleX0gYWxyZWFkeSBnb25lLiIpCiAgICAgICAgICAgICAgICAgICAgICAg
+IGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICAgICAgICAgICAgICAg
+ICAgICAgIGxvZ2dlci5lcnJvcihmIkVycm9yIHRlcm1pbmF0aW5nIGNoaWxk
+IHtjaGlsZC5waWR9IGZvciB7c2NyaXB0X2tleX06IHtlfS4gVHJ5aW5nIGtp
+bGwuLi4iKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgdHJ5OiBjaGls
+ZC5raWxsKCk7IGxvZ2dlci5pbmZvKGYiS2lsbGVkIGNoaWxkIHByb2Nlc3Mg
+e2NoaWxkLnBpZH0gZm9yIHtzY3JpcHRfa2V5fSIpCiAgICAgICAgICAgICAg
+ICAgICAgICAgICAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGUyOiBsb2dnZXIu
+ZXJyb3IoZiJGYWlsZWQgdG8ga2lsbCBjaGlsZCB7Y2hpbGQucGlkfSBmb3Ig
+e3NjcmlwdF9rZXl9OiB7ZTJ9IikKCiAgICAgICAgICAgICAgICAgICAgZ29u
+ZSwgYWxpdmUgPSBwc3V0aWwud2FpdF9wcm9jcyhjaGlsZHJlbiwgdGltZW91
+dD0xKQogICAgICAgICAgICAgICAgICAgIGZvciBwIGluIGFsaXZlOgogICAg
+ICAgICAgICAgICAgICAgICAgICBsb2dnZXIud2FybmluZyhmIkNoaWxkIHBy
+b2Nlc3Mge3AucGlkfSBmb3Ige3NjcmlwdF9rZXl9IHN0aWxsIGFsaXZlLiBL
+aWxsaW5nLiIpCiAgICAgICAgICAgICAgICAgICAgICAgIHRyeTogcC5raWxs
+KCkKICAgICAgICAgICAgICAgICAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbiBh
+cyBlOiBsb2dnZXIuZXJyb3IoZiJGYWlsZWQgdG8ga2lsbCBjaGlsZCB7cC5w
+aWR9IGZvciB7c2NyaXB0X2tleX0gYWZ0ZXIgd2FpdDoge2V9IikKCiAgICAg
+ICAgICAgICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgICAgICAgICBw
+YXJlbnQudGVybWluYXRlKCkKICAgICAgICAgICAgICAgICAgICAgICAgbG9n
+Z2VyLmluZm8oZiJUZXJtaW5hdGVkIHBhcmVudCBwcm9jZXNzIHtwaWR9IGZv
+ciB7c2NyaXB0X2tleX0iKQogICAgICAgICAgICAgICAgICAgICAgICB0cnk6
+IHBhcmVudC53YWl0KHRpbWVvdXQ9MSkKICAgICAgICAgICAgICAgICAgICAg
+ICAgZXhjZXB0IHBzdXRpbC5UaW1lb3V0RXhwaXJlZDoKICAgICAgICAgICAg
+ICAgICAgICAgICAgICAgIGxvZ2dlci53YXJuaW5nKGYiUGFyZW50IHByb2Nl
+c3Mge3BpZH0gZm9yIHtzY3JpcHRfa2V5fSBkaWQgbm90IHRlcm1pbmF0ZS4g
+S2lsbGluZy4iKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgcGFyZW50
+LmtpbGwoKQogICAgICAgICAgICAgICAgICAgICAgICAgICAgbG9nZ2VyLmlu
+Zm8oZiJLaWxsZWQgcGFyZW50IHByb2Nlc3Mge3BpZH0gZm9yIHtzY3JpcHRf
+a2V5fSIpCiAgICAgICAgICAgICAgICAgICAgZXhjZXB0IHBzdXRpbC5Ob1N1
+Y2hQcm9jZXNzOgogICAgICAgICAgICAgICAgICAgICAgICBsb2dnZXIud2Fy
+bmluZyhmIlBhcmVudCBwcm9jZXNzIHtwaWR9IGZvciB7c2NyaXB0X2tleX0g
+YWxyZWFkeSBnb25lLiIpCiAgICAgICAgICAgICAgICAgICAgZXhjZXB0IEV4
+Y2VwdGlvbiBhcyBlOgogICAgICAgICAgICAgICAgICAgICAgICBsb2dnZXIu
+ZXJyb3IoZiJFcnJvciB0ZXJtaW5hdGluZyBwYXJlbnQge3BpZH0gZm9yIHtz
+Y3JpcHRfa2V5fToge2V9LiBUcnlpbmcga2lsbC4uLiIpCiAgICAgICAgICAg
+ICAgICAgICAgICAgIHRyeTogcGFyZW50LmtpbGwoKTsgbG9nZ2VyLmluZm8o
+ZiJLaWxsZWQgcGFyZW50IHByb2Nlc3Mge3BpZH0gZm9yIHtzY3JpcHRfa2V5
+fSIpCiAgICAgICAgICAgICAgICAgICAgICAgIGV4Y2VwdCBFeGNlcHRpb24g
+YXMgZTI6IGxvZ2dlci5lcnJvcihmIkZhaWxlZCB0byBraWxsIHBhcmVudCB7
+cGlkfSBmb3Ige3NjcmlwdF9rZXl9OiB7ZTJ9IikKCiAgICAgICAgICAgICAg
+ICBleGNlcHQgcHN1dGlsLk5vU3VjaFByb2Nlc3M6CiAgICAgICAgICAgICAg
+ICAgICAgbG9nZ2VyLndhcm5pbmcoZiJQcm9jZXNzIHtwaWQgb3IgJ04vQSd9
+IGZvciB7c2NyaXB0X2tleX0gbm90IGZvdW5kIGR1cmluZyBraWxsLiBBbHJl
+YWR5IHRlcm1pbmF0ZWQ/IikKICAgICAgICAgICBlbHNlOiBsb2dnZXIuZXJy
+b3IoZiJQcm9jZXNzIFBJRCBpcyBOb25lIGZvciB7c2NyaXB0X2tleX0uIikK
+ICAgICAgICBlbGlmIGxvZ19maWxlX2Nsb3NlZDogbG9nZ2VyLndhcm5pbmco
+ZiJQcm9jZXNzIG9iamVjdCBtaXNzaW5nIGZvciB7c2NyaXB0X2tleX0sIGJ1
+dCBsb2cgZmlsZSBjbG9zZWQuIikKICAgICAgICBlbHNlOiBsb2dnZXIuZXJy
+b3IoZiJQcm9jZXNzIG9iamVjdCBtaXNzaW5nIGZvciB7c2NyaXB0X2tleX0s
+IGFuZCBubyBsb2cgZmlsZS4gQ2Fubm90IGtpbGwuIikKICAgIGV4Y2VwdCBF
+eGNlcHRpb24gYXMgZToKICAgICAgICBsb2dnZXIuZXJyb3IoZiLinYwgVW5l
+eHBlY3RlZCBlcnJvciBraWxsaW5nIHByb2Nlc3MgdHJlZSBmb3IgUElEIHtw
+aWQgb3IgJ04vQSd9ICh7c2NyaXB0X2tleX0pOiB7ZX0iLCBleGNfaW5mbz1U
+cnVlKQoKIyAtLS0gQXV0b21hdGljIFBhY2thZ2UgSW5zdGFsbGF0aW9uICYg
+U2NyaXB0IFJ1bm5pbmcgLS0tCgpkZWYgYXR0ZW1wdF9pbnN0YWxsX3BpcCht
+b2R1bGVfbmFtZSwgbWVzc2FnZSk6CiAgICBwYWNrYWdlX25hbWUgPSBURUxF
+R1JBTV9NT0RVTEVTLmdldChtb2R1bGVfbmFtZS5sb3dlcigpLCBtb2R1bGVf
+bmFtZSkgCiAgICBpZiBwYWNrYWdlX25hbWUgaXMgTm9uZTogCiAgICAgICAg
+bG9nZ2VyLmluZm8oZiJNb2R1bGUgJ3ttb2R1bGVfbmFtZX0nIGlzIGNvcmUu
+IFNraXBwaW5nIHBpcCBpbnN0YWxsLiIpCiAgICAgICAgcmV0dXJuIEZhbHNl
+IAogICAgdHJ5OgogICAgICAgIGJvdC5yZXBseV90byhtZXNzYWdlLCBmIvCf
+kI0gTW9kdWxlIGB7bW9kdWxlX25hbWV9YCBub3QgZm91bmQuIEluc3RhbGxp
+bmcgYHtwYWNrYWdlX25hbWV9YC4uLiIsIHBhcnNlX21vZGU9J01hcmtkb3du
+JykKICAgICAgICBjb21tYW5kID0gW3N5cy5leGVjdXRhYmxlLCAnLW0nLCAn
+cGlwJywgJ2luc3RhbGwnLCBwYWNrYWdlX25hbWVdCiAgICAgICAgbG9nZ2Vy
+LmluZm8oZiJSdW5uaW5nIGluc3RhbGw6IHsnICcuam9pbihjb21tYW5kKX0i
+KQogICAgICAgIHJlc3VsdCA9IHN1YnByb2Nlc3MucnVuKGNvbW1hbmQsIGNh
+cHR1cmVfb3V0cHV0PVRydWUsIHRleHQ9VHJ1ZSwgY2hlY2s9RmFsc2UsIGVu
+Y29kaW5nPSd1dGYtOCcsIGVycm9ycz0naWdub3JlJykKICAgICAgICBpZiBy
+ZXN1bHQucmV0dXJuY29kZSA9PSAwOgogICAgICAgICAgICBsb2dnZXIuaW5m
+byhmIkluc3RhbGxlZCB7cGFja2FnZV9uYW1lfS4gT3V0cHV0Olxue3Jlc3Vs
+dC5zdGRvdXR9IikKICAgICAgICAgICAgYm90LnJlcGx5X3RvKG1lc3NhZ2Us
+IGYi4pyFIFBhY2thZ2UgYHtwYWNrYWdlX25hbWV9YCAoZm9yIGB7bW9kdWxl
+X25hbWV9YCkgaW5zdGFsbGVkLiIsIHBhcnNlX21vZGU9J01hcmtkb3duJykK
+ICAgICAgICAgICAgcmV0dXJuIFRydWUKICAgICAgICBlbHNlOgogICAgICAg
+ICAgICBlcnJvcl9tc2cgPSBmIuKdjCBGYWlsZWQgdG8gaW5zdGFsbCBge3Bh
+Y2thZ2VfbmFtZX1gIGZvciBge21vZHVsZV9uYW1lfWAuXG5Mb2c6XG5gYGBc
+bntyZXN1bHQuc3RkZXJyIG9yIHJlc3VsdC5zdGRvdXR9XG5gYGAiCiAgICAg
+ICAgICAgIGxvZ2dlci5lcnJvcihlcnJvcl9tc2cpCiAgICAgICAgICAgIGlm
+IGxlbihlcnJvcl9tc2cpID4gNDAwMDogZXJyb3JfbXNnID0gZXJyb3JfbXNn
+Wzo0MDAwXSArICJcbi4uLiAoTG9nIHRydW5jYXRlZCkiCiAgICAgICAgICAg
+IGJvdC5yZXBseV90byhtZXNzYWdlLCBlcnJvcl9tc2csIHBhcnNlX21vZGU9
+J01hcmtkb3duJykKICAgICAgICAgICAgcmV0dXJuIEZhbHNlCiAgICBleGNl
+cHQgRXhjZXB0aW9uIGFzIGU6CiAgICAgICAgZXJyb3JfbXNnID0gZiLinYwg
+RXJyb3IgaW5zdGFsbGluZyBge3BhY2thZ2VfbmFtZX1gOiB7c3RyKGUpfSIK
+ICAgICAgICBsb2dnZXIuZXJyb3IoZXJyb3JfbXNnLCBleGNfaW5mbz1UcnVl
+KQogICAgICAgIGJvdC5yZXBseV90byhtZXNzYWdlLCBlcnJvcl9tc2cpCiAg
+ICAgICAgcmV0dXJuIEZhbHNlCgpkZWYgYXR0ZW1wdF9pbnN0YWxsX25wbSht
+b2R1bGVfbmFtZSwgdXNlcl9mb2xkZXIsIG1lc3NhZ2UpOgogICAgdHJ5Ogog
+ICAgICAgIGJvdC5yZXBseV90byhtZXNzYWdlLCBmIvCfn6AgTm9kZSBwYWNr
+YWdlIGB7bW9kdWxlX25hbWV9YCBub3QgZm91bmQuIEluc3RhbGxpbmcgbG9j
+YWxseS4uLiIsIHBhcnNlX21vZGU9J01hcmtkb3duJykKICAgICAgICBjb21t
+YW5kID0gWyducG0nLCAnaW5zdGFsbCcsIG1vZHVsZV9uYW1lXQogICAgICAg
+IGxvZ2dlci5pbmZvKGYiUnVubmluZyBucG0gaW5zdGFsbDogeycgJy5qb2lu
+KGNvbW1hbmQpfSBpbiB7dXNlcl9mb2xkZXJ9IikKICAgICAgICByZXN1bHQg
+PSBzdWJwcm9jZXNzLnJ1bihjb21tYW5kLCBjYXB0dXJlX291dHB1dD1UcnVl
+LCB0ZXh0PVRydWUsIGNoZWNrPUZhbHNlLCBjd2Q9dXNlcl9mb2xkZXIsIGVu
+Y29kaW5nPSd1dGYtOCcsIGVycm9ycz0naWdub3JlJykKICAgICAgICBpZiBy
+ZXN1bHQucmV0dXJuY29kZSA9PSAwOgogICAgICAgICAgICBsb2dnZXIuaW5m
+byhmIkluc3RhbGxlZCB7bW9kdWxlX25hbWV9LiBPdXRwdXQ6XG57cmVzdWx0
+LnN0ZG91dH0iKQogICAgICAgICAgICBib3QucmVwbHlfdG8obWVzc2FnZSwg
+ZiLinIUgTm9kZSBwYWNrYWdlIGB7bW9kdWxlX25hbWV9YCBpbnN0YWxsZWQg
+bG9jYWxseS4iLCBwYXJzZV9tb2RlPSdNYXJrZG93bicpCiAgICAgICAgICAg
+IHJldHVybiBUcnVlCiAgICAgICAgZWxzZToKICAgICAgICAgICAgZXJyb3Jf
+bXNnID0gZiLinYwgRmFpbGVkIHRvIGluc3RhbGwgTm9kZSBwYWNrYWdlIGB7
+bW9kdWxlX25hbWV9YC5cbkxvZzpcbmBgYFxue3Jlc3VsdC5zdGRlcnIgb3Ig
+cmVzdWx0LnN0ZG91dH1cbmBgYCIKICAgICAgICAgICAgbG9nZ2VyLmVycm9y
+KGVycm9yX21zZykKICAgICAgICAgICAgaWYgbGVuKGVycm9yX21zZykgPiA0
+MDAwOiBlcnJvcl9tc2cgPSBlcnJvcl9tc2dbOjQwMDBdICsgIlxuLi4uIChM
+b2cgdHJ1bmNhdGVkKSIKICAgICAgICAgICAgYm90LnJlcGx5X3RvKG1lc3Nh
+Z2UsIGVycm9yX21zZywgcGFyc2VfbW9kZT0nTWFya2Rvd24nKQogICAgICAg
+ICAgICByZXR1cm4gRmFsc2UKICAgIGV4Y2VwdCBGaWxlTm90Rm91bmRFcnJv
+cjoKICAgICAgICAgZXJyb3JfbXNnID0gIuKdjCBFcnJvcjogJ25wbScgbm90
+IGZvdW5kLiBFbnN1cmUgTm9kZS5qcy9ucG0gYXJlIGluc3RhbGxlZCBhbmQg
+aW4gUEFUSC4iCiAgICAgICAgIGxvZ2dlci5lcnJvcihlcnJvcl9tc2cpCiAg
+ICAgICAgIGJvdC5yZXBseV90byhtZXNzYWdlLCBlcnJvcl9tc2cpCiAgICAg
+ICAgIHJldHVybiBGYWxzZQogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgog
+ICAgICAgIGVycm9yX21zZyA9IGYi4p2MIEVycm9yIGluc3RhbGxpbmcgTm9k
+ZSBwYWNrYWdlIGB7bW9kdWxlX25hbWV9YDoge3N0cihlKX0iCiAgICAgICAg
+bG9nZ2VyLmVycm9yKGVycm9yX21zZywgZXhjX2luZm89VHJ1ZSkKICAgICAg
+ICBib3QucmVwbHlfdG8obWVzc2FnZSwgZXJyb3JfbXNnKQogICAgICAgIHJl
+dHVybiBGYWxzZQoKZGVmIHJ1bl9zY3JpcHQoc2NyaXB0X3BhdGgsIHNjcmlw
+dF9vd25lcl9pZCwgdXNlcl9mb2xkZXIsIGZpbGVfbmFtZSwgbWVzc2FnZV9v
+YmpfZm9yX3JlcGx5LCBhdHRlbXB0PTEpOgogICAgIiIiUnVuIFB5dGhvbiBz
+Y3JpcHQuIHNjcmlwdF9vd25lcl9pZCBpcyB1c2VkIGZvciB0aGUgc2NyaXB0
+X2tleS4gbWVzc2FnZV9vYmpfZm9yX3JlcGx5IGlzIGZvciBzZW5kaW5nIGZl
+ZWRiYWNrLiIiIgogICAgbWF4X2F0dGVtcHRzID0gMiAKICAgIGlmIGF0dGVt
+cHQgPiBtYXhfYXR0ZW1wdHM6CiAgICAgICAgYm90LnJlcGx5X3RvKG1lc3Nh
+Z2Vfb2JqX2Zvcl9yZXBseSwgZiLinYwgRmFpbGVkIHRvIHJ1biAne2ZpbGVf
+bmFtZX0nIGFmdGVyIHttYXhfYXR0ZW1wdHN9IGF0dGVtcHRzLiBDaGVjayBs
+b2dzLiIpCiAgICAgICAgcmV0dXJuCgogICAgc2NyaXB0X2tleSA9IGYie3Nj
+cmlwdF9vd25lcl9pZH1fe2ZpbGVfbmFtZX0iCiAgICBsb2dnZXIuaW5mbyhm
+IkF0dGVtcHQge2F0dGVtcHR9IHRvIHJ1biBQeXRob24gc2NyaXB0OiB7c2Ny
+aXB0X3BhdGh9IChLZXk6IHtzY3JpcHRfa2V5fSkgZm9yIHVzZXIge3Njcmlw
+dF9vd25lcl9pZH0iKQoKICAgIHRyeToKICAgICAgICBpZiBub3Qgb3MucGF0
+aC5leGlzdHMoc2NyaXB0X3BhdGgpOgogICAgICAgICAgICAgYm90LnJlcGx5
+X3RvKG1lc3NhZ2Vfb2JqX2Zvcl9yZXBseSwgZiLinYwgRXJyb3I6IFNjcmlw
+dCAne2ZpbGVfbmFtZX0nIG5vdCBmb3VuZCBhdCAne3NjcmlwdF9wYXRofSch
+IikKICAgICAgICAgICAgIGxvZ2dlci5lcnJvcihmIlNjcmlwdCBub3QgZm91
+bmQ6IHtzY3JpcHRfcGF0aH0gZm9yIHVzZXIge3NjcmlwdF9vd25lcl9pZH0i
+KQogICAgICAgICAgICAgaWYgc2NyaXB0X293bmVyX2lkIGluIHVzZXJfZmls
+ZXM6CiAgICAgICAgICAgICAgICAgdXNlcl9maWxlc1tzY3JpcHRfb3duZXJf
+aWRdID0gW2YgZm9yIGYgaW4gdXNlcl9maWxlcy5nZXQoc2NyaXB0X293bmVy
+X2lkLCBbXSkgaWYgZlswXSAhPSBmaWxlX25hbWVdCiAgICAgICAgICAgICBy
+ZW1vdmVfdXNlcl9maWxlX2RiKHNjcmlwdF9vd25lcl9pZCwgZmlsZV9uYW1l
+KQogICAgICAgICAgICAgcmV0dXJuCgogICAgICAgIGlmIGF0dGVtcHQgPT0g
+MToKICAgICAgICAgICAgY2hlY2tfY29tbWFuZCA9IFtzeXMuZXhlY3V0YWJs
+ZSwgc2NyaXB0X3BhdGhdCiAgICAgICAgICAgIGxvZ2dlci5pbmZvKGYiUnVu
+bmluZyBQeXRob24gcHJlLWNoZWNrOiB7JyAnLmpvaW4oY2hlY2tfY29tbWFu
+ZCl9IikKICAgICAgICAgICAgY2hlY2tfcHJvYyA9IE5vbmUKICAgICAgICAg
+ICAgdHJ5OgogICAgICAgICAgICAgICAgY2hlY2tfcHJvYyA9IHN1YnByb2Nl
+c3MuUG9wZW4oY2hlY2tfY29tbWFuZCwgY3dkPXVzZXJfZm9sZGVyLCBzdGRv
+dXQ9c3VicHJvY2Vzcy5QSVBFLCBzdGRlcnI9c3VicHJvY2Vzcy5QSVBFLCB0
+ZXh0PVRydWUsIGVuY29kaW5nPSd1dGYtOCcsIGVycm9ycz0naWdub3JlJykK
+ICAgICAgICAgICAgICAgIHN0ZG91dCwgc3RkZXJyID0gY2hlY2tfcHJvYy5j
+b21tdW5pY2F0ZSh0aW1lb3V0PTUpCiAgICAgICAgICAgICAgICByZXR1cm5f
+Y29kZSA9IGNoZWNrX3Byb2MucmV0dXJuY29kZQogICAgICAgICAgICAgICAg
+bG9nZ2VyLmluZm8oZiJQeXRob24gUHJlLWNoZWNrIGVhcmx5LiBSQzoge3Jl
+dHVybl9jb2RlfS4gU3RkZXJyOiB7c3RkZXJyWzoyMDBdfS4uLiIpCiAgICAg
+ICAgICAgICAgICBpZiByZXR1cm5fY29kZSAhPSAwIGFuZCBzdGRlcnI6CiAg
+ICAgICAgICAgICAgICAgICAgbWF0Y2hfcHkgPSByZS5zZWFyY2gociJNb2R1
+bGVOb3RGb3VuZEVycm9yOiBObyBtb2R1bGUgbmFtZWQgJyguKz8pJyIsIHN0
+ZGVycikKICAgICAgICAgICAgICAgICAgICBpZiBtYXRjaF9weToKICAgICAg
+ICAgICAgICAgICAgICAgICAgbW9kdWxlX25hbWUgPSBtYXRjaF9weS5ncm91
+cCgxKS5zdHJpcCgpLnN0cmlwKCInXCIiKQogICAgICAgICAgICAgICAgICAg
+ICAgICBsb2dnZXIuaW5mbyhmIkRldGVjdGVkIG1pc3NpbmcgUHl0aG9uIG1v
+ZHVsZToge21vZHVsZV9uYW1lfSIpCiAgICAgICAgICAgICAgICAgICAgICAg
+IGlmIGF0dGVtcHRfaW5zdGFsbF9waXAobW9kdWxlX25hbWUsIG1lc3NhZ2Vf
+b2JqX2Zvcl9yZXBseSk6CiAgICAgICAgICAgICAgICAgICAgICAgICAgICBs
+b2dnZXIuaW5mbyhmIkluc3RhbGwgT0sgZm9yIHttb2R1bGVfbmFtZX0uIFJl
+dHJ5aW5nIHJ1bl9zY3JpcHQuLi4iKQogICAgICAgICAgICAgICAgICAgICAg
+ICAgICAgYm90LnJlcGx5X3RvKG1lc3NhZ2Vfb2JqX2Zvcl9yZXBseSwgZiLw
+n5SEIEluc3RhbGwgc3VjY2Vzc2Z1bC4gUmV0cnlpbmcgJ3tmaWxlX25hbWV9
+Jy4uLiIpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICB0aW1lLnNsZWVw
+KDIpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICB0aHJlYWRpbmcuVGhy
+ZWFkKHRhcmdldD1ydW5fc2NyaXB0LCBhcmdzPShzY3JpcHRfcGF0aCwgc2Ny
+aXB0X293bmVyX2lkLCB1c2VyX2ZvbGRlciwgZmlsZV9uYW1lLCBtZXNzYWdl
+X29ial9mb3JfcmVwbHksIGF0dGVtcHQgKyAxKSkuc3RhcnQoKQogICAgICAg
+ICAgICAgICAgICAgICAgICAgICAgcmV0dXJuCiAgICAgICAgICAgICAgICAg
+ICAgICAgIGVsc2U6CiAgICAgICAgICAgICAgICAgICAgICAgICAgICBib3Qu
+cmVwbHlfdG8obWVzc2FnZV9vYmpfZm9yX3JlcGx5LCBmIuKdjCBJbnN0YWxs
+IGZhaWxlZC4gQ2Fubm90IHJ1biAne2ZpbGVfbmFtZX0nLiIpCiAgICAgICAg
+ICAgICAgICAgICAgICAgICAgICByZXR1cm4KICAgICAgICAgICAgICAgICAg
+ICBlbHNlOgogICAgICAgICAgICAgICAgICAgICAgICAgZXJyb3Jfc3VtbWFy
+eSA9IHN0ZGVycls6NTAwXQogICAgICAgICAgICAgICAgICAgICAgICAgYm90
+LnJlcGx5X3RvKG1lc3NhZ2Vfb2JqX2Zvcl9yZXBseSwgZiLinYwgRXJyb3Ig
+aW4gc2NyaXB0IHByZS1jaGVjayBmb3IgJ3tmaWxlX25hbWV9JzpcbmBgYFxu
+e2Vycm9yX3N1bW1hcnl9XG5gYGBcbkZpeCB0aGUgc2NyaXB0LiIsIHBhcnNl
+X21vZGU9J01hcmtkb3duJykKICAgICAgICAgICAgICAgICAgICAgICAgIHJl
+dHVybgogICAgICAgICAgICBleGNlcHQgc3VicHJvY2Vzcy5UaW1lb3V0RXhw
+aXJlZDoKICAgICAgICAgICAgICAgIGxvZ2dlci5pbmZvKCJQeXRob24gUHJl
+LWNoZWNrIHRpbWVkIG91dCAoPjVzKSwgaW1wb3J0cyBsaWtlbHkgT0suIEtp
+bGxpbmcgY2hlY2sgcHJvY2Vzcy4iKQogICAgICAgICAgICAgICAgaWYgY2hl
+Y2tfcHJvYyBhbmQgY2hlY2tfcHJvYy5wb2xsKCkgaXMgTm9uZTogY2hlY2tf
+cHJvYy5raWxsKCk7IGNoZWNrX3Byb2MuY29tbXVuaWNhdGUoKQogICAgICAg
+ICAgICAgICAgbG9nZ2VyLmluZm8oIlB5dGhvbiBDaGVjayBwcm9jZXNzIGtp
+bGxlZC4gUHJvY2VlZGluZyB0byBsb25nIHJ1bi4iKQogICAgICAgICAgICBl
+eGNlcHQgRmlsZU5vdEZvdW5kRXJyb3I6CiAgICAgICAgICAgICAgICAgbG9n
+Z2VyLmVycm9yKGYiUHl0aG9uIGludGVycHJldGVyIG5vdCBmb3VuZDoge3N5
+cy5leGVjdXRhYmxlfSIpCiAgICAgICAgICAgICAgICAgYm90LnJlcGx5X3Rv
+KG1lc3NhZ2Vfb2JqX2Zvcl9yZXBseSwgZiLinYwgRXJyb3I6IFB5dGhvbiBp
+bnRlcnByZXRlciAne3N5cy5leGVjdXRhYmxlfScgbm90IGZvdW5kLiIpCiAg
+ICAgICAgICAgICAgICAgcmV0dXJuCiAgICAgICAgICAgIGV4Y2VwdCBFeGNl
+cHRpb24gYXMgZToKICAgICAgICAgICAgICAgICBsb2dnZXIuZXJyb3IoZiJF
+cnJvciBpbiBQeXRob24gcHJlLWNoZWNrIGZvciB7c2NyaXB0X2tleX06IHtl
+fSIsIGV4Y19pbmZvPVRydWUpCiAgICAgICAgICAgICAgICAgYm90LnJlcGx5
+X3RvKG1lc3NhZ2Vfb2JqX2Zvcl9yZXBseSwgZiLinYwgVW5leHBlY3RlZCBl
+cnJvciBpbiBzY3JpcHQgcHJlLWNoZWNrIGZvciAne2ZpbGVfbmFtZX0nOiB7
+ZX0iKQogICAgICAgICAgICAgICAgIHJldHVybgogICAgICAgICAgICBmaW5h
+bGx5OgogICAgICAgICAgICAgICAgIGlmIGNoZWNrX3Byb2MgYW5kIGNoZWNr
+X3Byb2MucG9sbCgpIGlzIE5vbmU6CiAgICAgICAgICAgICAgICAgICAgIGxv
+Z2dlci53YXJuaW5nKGYiUHl0aG9uIENoZWNrIHByb2Nlc3Mge2NoZWNrX3By
+b2MucGlkfSBzdGlsbCBydW5uaW5nLiBLaWxsaW5nLiIpCiAgICAgICAgICAg
+ICAgICAgICAgIGNoZWNrX3Byb2Mua2lsbCgpOyBjaGVja19wcm9jLmNvbW11
+bmljYXRlKCkKCiAgICAgICAgbG9nZ2VyLmluZm8oZiJTdGFydGluZyBsb25n
+LXJ1bm5pbmcgUHl0aG9uIHByb2Nlc3MgZm9yIHtzY3JpcHRfa2V5fSIpCiAg
+ICAgICAgbG9nX2ZpbGVfcGF0aCA9IG9zLnBhdGguam9pbih1c2VyX2ZvbGRl
+ciwgZiJ7b3MucGF0aC5zcGxpdGV4dChmaWxlX25hbWUpWzBdfS5sb2ciKQog
+ICAgICAgIGxvZ19maWxlID0gTm9uZTsgcHJvY2VzcyA9IE5vbmUKICAgICAg
+ICB0cnk6IGxvZ19maWxlID0gb3Blbihsb2dfZmlsZV9wYXRoLCAndycsIGVu
+Y29kaW5nPSd1dGYtOCcsIGVycm9ycz0naWdub3JlJykKICAgICAgICBleGNl
+cHQgRXhjZXB0aW9uIGFzIGU6CiAgICAgICAgICAgICBsb2dnZXIuZXJyb3Io
+ZiJGYWlsZWQgdG8gb3BlbiBsb2cgZmlsZSAne2xvZ19maWxlX3BhdGh9JyBm
+b3Ige3NjcmlwdF9rZXl9OiB7ZX0iLCBleGNfaW5mbz1UcnVlKQogICAgICAg
+ICAgICAgYm90LnJlcGx5X3RvKG1lc3NhZ2Vfb2JqX2Zvcl9yZXBseSwgZiLi
+nYwgRmFpbGVkIHRvIG9wZW4gbG9nIGZpbGUgJ3tsb2dfZmlsZV9wYXRofSc6
+IHtlfSIpCiAgICAgICAgICAgICByZXR1cm4KICAgICAgICB0cnk6CiAgICAg
+ICAgICAgIHN0YXJ0dXBpbmZvID0gTm9uZTsgY3JlYXRpb25mbGFncyA9IDAK
+ICAgICAgICAgICAgaWYgb3MubmFtZSA9PSAnbnQnOgogICAgICAgICAgICAg
+ICAgIHN0YXJ0dXBpbmZvID0gc3VicHJvY2Vzcy5TVEFSVFVQSU5GTygpOyBz
+dGFydHVwaW5mby5kd0ZsYWdzIHw9IHN1YnByb2Nlc3MuU1RBUlRGX1VTRVNI
+T1dXSU5ET1cKICAgICAgICAgICAgICAgICBzdGFydHVwaW5mby53U2hvd1dp
+bmRvdyA9IHN1YnByb2Nlc3MuU1dfSElERQogICAgICAgICAgICBwcm9jZXNz
+ID0gc3VicHJvY2Vzcy5Qb3BlbigKICAgICAgICAgICAgICAgIFtzeXMuZXhl
+Y3V0YWJsZSwgc2NyaXB0X3BhdGhdLCBjd2Q9dXNlcl9mb2xkZXIsIHN0ZG91
+dD1sb2dfZmlsZSwgc3RkZXJyPWxvZ19maWxlLAogICAgICAgICAgICAgICAg
+c3RkaW49c3VicHJvY2Vzcy5QSVBFLCBzdGFydHVwaW5mbz1zdGFydHVwaW5m
+bywgY3JlYXRpb25mbGFncz1jcmVhdGlvbmZsYWdzLAogICAgICAgICAgICAg
+ICAgZW5jb2Rpbmc9J3V0Zi04JywgZXJyb3JzPSdpZ25vcmUnCiAgICAgICAg
+ICAgICkKICAgICAgICAgICAgbG9nZ2VyLmluZm8oZiJTdGFydGVkIFB5dGhv
+biBwcm9jZXNzIHtwcm9jZXNzLnBpZH0gZm9yIHtzY3JpcHRfa2V5fSIpCiAg
+ICAgICAgICAgIGJvdF9zY3JpcHRzW3NjcmlwdF9rZXldID0gewogICAgICAg
+ICAgICAgICAgJ3Byb2Nlc3MnOiBwcm9jZXNzLCAnbG9nX2ZpbGUnOiBsb2df
+ZmlsZSwgJ2ZpbGVfbmFtZSc6IGZpbGVfbmFtZSwKICAgICAgICAgICAgICAg
+ICdjaGF0X2lkJzogbWVzc2FnZV9vYmpfZm9yX3JlcGx5LmNoYXQuaWQsICMg
+Q2hhdCBJRCBmb3IgcG90ZW50aWFsIGZ1dHVyZSBkaXJlY3QgcmVwbGllcyBm
+cm9tIHNjcmlwdCwgZGVmYXVsdHMgdG8gYWRtaW4vdHJpZ2dlcmluZyB1c2Vy
+CiAgICAgICAgICAgICAgICAnc2NyaXB0X293bmVyX2lkJzogc2NyaXB0X293
+bmVyX2lkLCAjIEFjdHVhbCBvd25lciBvZiB0aGUgc2NyaXB0CiAgICAgICAg
+ICAgICAgICAnc3RhcnRfdGltZSc6IGRhdGV0aW1lLm5vdygpLCAndXNlcl9m
+b2xkZXInOiB1c2VyX2ZvbGRlciwgJ3R5cGUnOiAncHknLCAnc2NyaXB0X2tl
+eSc6IHNjcmlwdF9rZXkKICAgICAgICAgICAgfQogICAgICAgICAgICBib3Qu
+cmVwbHlfdG8obWVzc2FnZV9vYmpfZm9yX3JlcGx5LCBmIuKchSBQeXRob24g
+c2NyaXB0ICd7ZmlsZV9uYW1lfScgc3RhcnRlZCEgKFBJRDoge3Byb2Nlc3Mu
+cGlkfSkgKEZvciBVc2VyOiB7c2NyaXB0X293bmVyX2lkfSkiKQogICAgICAg
+IGV4Y2VwdCBGaWxlTm90Rm91bmRFcnJvcjoKICAgICAgICAgICAgIGxvZ2dl
+ci5lcnJvcihmIlB5dGhvbiBpbnRlcnByZXRlciB7c3lzLmV4ZWN1dGFibGV9
+IG5vdCBmb3VuZCBmb3IgbG9uZyBydW4ge3NjcmlwdF9rZXl9IikKICAgICAg
+ICAgICAgIGJvdC5yZXBseV90byhtZXNzYWdlX29ial9mb3JfcmVwbHksIGYi
+4p2MIEVycm9yOiBQeXRob24gaW50ZXJwcmV0ZXIgJ3tzeXMuZXhlY3V0YWJs
+ZX0nIG5vdCBmb3VuZC4iKQogICAgICAgICAgICAgaWYgbG9nX2ZpbGUgYW5k
+IG5vdCBsb2dfZmlsZS5jbG9zZWQ6IGxvZ19maWxlLmNsb3NlKCkKICAgICAg
+ICAgICAgIGlmIHNjcmlwdF9rZXkgaW4gYm90X3NjcmlwdHM6IGRlbCBib3Rf
+c2NyaXB0c1tzY3JpcHRfa2V5XQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb24g
+YXMgZToKICAgICAgICAgICAgaWYgbG9nX2ZpbGUgYW5kIG5vdCBsb2dfZmls
+ZS5jbG9zZWQ6IGxvZ19maWxlLmNsb3NlKCkKICAgICAgICAgICAgZXJyb3Jf
+bXNnID0gZiLinYwgRXJyb3Igc3RhcnRpbmcgUHl0aG9uIHNjcmlwdCAne2Zp
+bGVfbmFtZX0nOiB7c3RyKGUpfSIKICAgICAgICAgICAgbG9nZ2VyLmVycm9y
+KGVycm9yX21zZywgZXhjX2luZm89VHJ1ZSkKICAgICAgICAgICAgYm90LnJl
+cGx5X3RvKG1lc3NhZ2Vfb2JqX2Zvcl9yZXBseSwgZXJyb3JfbXNnKQogICAg
+ICAgICAgICBpZiBwcm9jZXNzIGFuZCBwcm9jZXNzLnBvbGwoKSBpcyBOb25l
+OgogICAgICAgICAgICAgICAgIGxvZ2dlci53YXJuaW5nKGYiS2lsbGluZyBw
+b3RlbnRpYWxseSBzdGFydGVkIFB5dGhvbiBwcm9jZXNzIHtwcm9jZXNzLnBp
+ZH0gZm9yIHtzY3JpcHRfa2V5fSIpCiAgICAgICAgICAgICAgICAga2lsbF9w
+cm9jZXNzX3RyZWUoeydwcm9jZXNzJzogcHJvY2VzcywgJ2xvZ19maWxlJzog
+bG9nX2ZpbGUsICdzY3JpcHRfa2V5Jzogc2NyaXB0X2tleX0pCiAgICAgICAg
+ICAgIGlmIHNjcmlwdF9rZXkgaW4gYm90X3NjcmlwdHM6IGRlbCBib3Rfc2Ny
+aXB0c1tzY3JpcHRfa2V5XQogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgog
+ICAgICAgIGVycm9yX21zZyA9IGYi4p2MIFVuZXhwZWN0ZWQgZXJyb3IgcnVu
+bmluZyBQeXRob24gc2NyaXB0ICd7ZmlsZV9uYW1lfSc6IHtzdHIoZSl9Igog
+ICAgICAgIGxvZ2dlci5lcnJvcihlcnJvcl9tc2csIGV4Y19pbmZvPVRydWUp
+CiAgICAgICAgYm90LnJlcGx5X3RvKG1lc3NhZ2Vfb2JqX2Zvcl9yZXBseSwg
+ZXJyb3JfbXNnKQogICAgICAgIGlmIHNjcmlwdF9rZXkgaW4gYm90X3Njcmlw
+dHM6CiAgICAgICAgICAgICBsb2dnZXIud2FybmluZyhmIkNsZWFuaW5nIHVw
+IHtzY3JpcHRfa2V5fSBkdWUgdG8gZXJyb3IgaW4gcnVuX3NjcmlwdC4iKQog
+ICAgICAgICAgICAga2lsbF9wcm9jZXNzX3RyZWUoYm90X3NjcmlwdHNbc2Ny
+aXB0X2tleV0pCiAgICAgICAgICAgICBkZWwgYm90X3NjcmlwdHNbc2NyaXB0
+X2tleV0KCmRlZiBydW5fanNfc2NyaXB0KHNjcmlwdF9wYXRoLCBzY3JpcHRf
+b3duZXJfaWQsIHVzZXJfZm9sZGVyLCBmaWxlX25hbWUsIG1lc3NhZ2Vfb2Jq
+X2Zvcl9yZXBseSwgYXR0ZW1wdD0xKToKICAgICIiIlJ1biBKUyBzY3JpcHQu
+IHNjcmlwdF9vd25lcl9pZCBpcyB1c2VkIGZvciB0aGUgc2NyaXB0X2tleS4g
+bWVzc2FnZV9vYmpfZm9yX3JlcGx5IGlzIGZvciBzZW5kaW5nIGZlZWRiYWNr
+LiIiIgogICAgbWF4X2F0dGVtcHRzID0gMgogICAgaWYgYXR0ZW1wdCA+IG1h
+eF9hdHRlbXB0czoKICAgICAgICBib3QucmVwbHlfdG8obWVzc2FnZV9vYmpf
+Zm9yX3JlcGx5LCBmIuKdjCBGYWlsZWQgdG8gcnVuICd7ZmlsZV9uYW1lfScg
+YWZ0ZXIge21heF9hdHRlbXB0c30gYXR0ZW1wdHMuIENoZWNrIGxvZ3MuIikK
+ICAgICAgICByZXR1cm4KCiAgICBzY3JpcHRfa2V5ID0gZiJ7c2NyaXB0X293
+bmVyX2lkfV97ZmlsZV9uYW1lfSIKICAgIGxvZ2dlci5pbmZvKGYiQXR0ZW1w
+dCB7YXR0ZW1wdH0gdG8gcnVuIEpTIHNjcmlwdDoge3NjcmlwdF9wYXRofSAo
+S2V5OiB7c2NyaXB0X2tleX0pIGZvciB1c2VyIHtzY3JpcHRfb3duZXJfaWR9
+IikKCiAgICB0cnk6CiAgICAgICAgaWYgbm90IG9zLnBhdGguZXhpc3RzKHNj
+cmlwdF9wYXRoKToKICAgICAgICAgICAgIGJvdC5yZXBseV90byhtZXNzYWdl
+X29ial9mb3JfcmVwbHksIGYi4p2MIEVycm9yOiBTY3JpcHQgJ3tmaWxlX25h
+bWV9JyBub3QgZm91bmQgYXQgJ3tzY3JpcHRfcGF0aH0nISIpCiAgICAgICAg
+ICAgICBsb2dnZXIuZXJyb3IoZiJKUyBTY3JpcHQgbm90IGZvdW5kOiB7c2Ny
+aXB0X3BhdGh9IGZvciB1c2VyIHtzY3JpcHRfb3duZXJfaWR9IikKICAgICAg
+ICAgICAgIGlmIHNjcmlwdF9vd25lcl9pZCBpbiB1c2VyX2ZpbGVzOgogICAg
+ICAgICAgICAgICAgIHVzZXJfZmlsZXNbc2NyaXB0X293bmVyX2lkXSA9IFtm
+IGZvciBmIGluIHVzZXJfZmlsZXMuZ2V0KHNjcmlwdF9vd25lcl9pZCwgW10p
+IGlmIGZbMF0gIT0gZmlsZV9uYW1lXQogICAgICAgICAgICAgcmVtb3ZlX3Vz
+ZXJfZmlsZV9kYihzY3JpcHRfb3duZXJfaWQsIGZpbGVfbmFtZSkKICAgICAg
+ICAgICAgIHJldHVybgoKICAgICAgICBpZiBhdHRlbXB0ID09IDE6CiAgICAg
+ICAgICAgIGNoZWNrX2NvbW1hbmQgPSBbJ25vZGUnLCBzY3JpcHRfcGF0aF0K
+ICAgICAgICAgICAgbG9nZ2VyLmluZm8oZiJSdW5uaW5nIEpTIHByZS1jaGVj
+azogeycgJy5qb2luKGNoZWNrX2NvbW1hbmQpfSIpCiAgICAgICAgICAgIGNo
+ZWNrX3Byb2MgPSBOb25lCiAgICAgICAgICAgIHRyeToKICAgICAgICAgICAg
+ICAgIGNoZWNrX3Byb2MgPSBzdWJwcm9jZXNzLlBvcGVuKGNoZWNrX2NvbW1h
+bmQsIGN3ZD11c2VyX2ZvbGRlciwgc3Rkb3V0PXN1YnByb2Nlc3MuUElQRSwg
+c3RkZXJyPXN1YnByb2Nlc3MuUElQRSwgdGV4dD1UcnVlLCBlbmNvZGluZz0n
+dXRmLTgnLCBlcnJvcnM9J2lnbm9yZScpCiAgICAgICAgICAgICAgICBzdGRv
+dXQsIHN0ZGVyciA9IGNoZWNrX3Byb2MuY29tbXVuaWNhdGUodGltZW91dD01
+KQogICAgICAgICAgICAgICAgcmV0dXJuX2NvZGUgPSBjaGVja19wcm9jLnJl
+dHVybmNvZGUKICAgICAgICAgICAgICAgIGxvZ2dlci5pbmZvKGYiSlMgUHJl
+LWNoZWNrIGVhcmx5LiBSQzoge3JldHVybl9jb2RlfS4gU3RkZXJyOiB7c3Rk
+ZXJyWzoyMDBdfS4uLiIpCiAgICAgICAgICAgICAgICBpZiByZXR1cm5fY29k
+ZSAhPSAwIGFuZCBzdGRlcnI6CiAgICAgICAgICAgICAgICAgICAgbWF0Y2hf
+anMgPSByZS5zZWFyY2gociJDYW5ub3QgZmluZCBtb2R1bGUgJyguKz8pJyIs
+IHN0ZGVycikKICAgICAgICAgICAgICAgICAgICBpZiBtYXRjaF9qczoKICAg
+ICAgICAgICAgICAgICAgICAgICAgbW9kdWxlX25hbWUgPSBtYXRjaF9qcy5n
+cm91cCgxKS5zdHJpcCgpLnN0cmlwKCInXCIiKQogICAgICAgICAgICAgICAg
+ICAgICAgICBpZiBub3QgbW9kdWxlX25hbWUuc3RhcnRzd2l0aCgnLicpIGFu
+ZCBub3QgbW9kdWxlX25hbWUuc3RhcnRzd2l0aCgnLycpOgogICAgICAgICAg
+ICAgICAgICAgICAgICAgICAgIGxvZ2dlci5pbmZvKGYiRGV0ZWN0ZWQgbWlz
+c2luZyBOb2RlIG1vZHVsZToge21vZHVsZV9uYW1lfSIpCiAgICAgICAgICAg
+ICAgICAgICAgICAgICAgICAgaWYgYXR0ZW1wdF9pbnN0YWxsX25wbShtb2R1
+bGVfbmFtZSwgdXNlcl9mb2xkZXIsIG1lc3NhZ2Vfb2JqX2Zvcl9yZXBseSk6
+CiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGxvZ2dlci5pbmZv
+KGYiTlBNIEluc3RhbGwgT0sgZm9yIHttb2R1bGVfbmFtZX0uIFJldHJ5aW5n
+IHJ1bl9qc19zY3JpcHQuLi4iKQogICAgICAgICAgICAgICAgICAgICAgICAg
+ICAgICAgICBib3QucmVwbHlfdG8obWVzc2FnZV9vYmpfZm9yX3JlcGx5LCBm
+IvCflIQgTlBNIEluc3RhbGwgc3VjY2Vzc2Z1bC4gUmV0cnlpbmcgJ3tmaWxl
+X25hbWV9Jy4uLiIpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg
+IHRpbWUuc2xlZXAoMikKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg
+ICAgdGhyZWFkaW5nLlRocmVhZCh0YXJnZXQ9cnVuX2pzX3NjcmlwdCwgYXJn
+cz0oc2NyaXB0X3BhdGgsIHNjcmlwdF9vd25lcl9pZCwgdXNlcl9mb2xkZXIs
+IGZpbGVfbmFtZSwgbWVzc2FnZV9vYmpfZm9yX3JlcGx5LCBhdHRlbXB0ICsg
+MSkpLnN0YXJ0KCkKICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAg
+cmV0dXJuCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgZWxzZToKICAg
+ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgYm90LnJlcGx5X3RvKG1l
+c3NhZ2Vfb2JqX2Zvcl9yZXBseSwgZiLinYwgTlBNIEluc3RhbGwgZmFpbGVk
+LiBDYW5ub3QgcnVuICd7ZmlsZV9uYW1lfScuIikKICAgICAgICAgICAgICAg
+ICAgICAgICAgICAgICAgICAgcmV0dXJuCiAgICAgICAgICAgICAgICAgICAg
+ICAgIGVsc2U6IGxvZ2dlci5pbmZvKGYiU2tpcHBpbmcgbnBtIGluc3RhbGwg
+Zm9yIHJlbGF0aXZlL2NvcmU6IHttb2R1bGVfbmFtZX0iKQogICAgICAgICAg
+ICAgICAgICAgIGVycm9yX3N1bW1hcnkgPSBzdGRlcnJbOjUwMF0KICAgICAg
+ICAgICAgICAgICAgICBib3QucmVwbHlfdG8obWVzc2FnZV9vYmpfZm9yX3Jl
+cGx5LCBmIuKdjCBFcnJvciBpbiBKUyBzY3JpcHQgcHJlLWNoZWNrIGZvciAn
+e2ZpbGVfbmFtZX0nOlxuYGBgXG57ZXJyb3Jfc3VtbWFyeX1cbmBgYFxuRml4
+IHNjcmlwdCBvciBpbnN0YWxsIG1hbnVhbGx5LiIsIHBhcnNlX21vZGU9J01h
+cmtkb3duJykKICAgICAgICAgICAgICAgICAgICByZXR1cm4KICAgICAgICAg
+ICAgZXhjZXB0IHN1YnByb2Nlc3MuVGltZW91dEV4cGlyZWQ6CiAgICAgICAg
+ICAgICAgICBsb2dnZXIuaW5mbygiSlMgUHJlLWNoZWNrIHRpbWVkIG91dCAo
+PjVzKSwgaW1wb3J0cyBsaWtlbHkgT0suIEtpbGxpbmcgY2hlY2sgcHJvY2Vz
+cy4iKQogICAgICAgICAgICAgICAgaWYgY2hlY2tfcHJvYyBhbmQgY2hlY2tf
+cHJvYy5wb2xsKCkgaXMgTm9uZTogY2hlY2tfcHJvYy5raWxsKCk7IGNoZWNr
+X3Byb2MuY29tbXVuaWNhdGUoKQogICAgICAgICAgICAgICAgbG9nZ2VyLmlu
+Zm8oIkpTIENoZWNrIHByb2Nlc3Mga2lsbGVkLiBQcm9jZWVkaW5nIHRvIGxv
+bmcgcnVuLiIpCiAgICAgICAgICAgIGV4Y2VwdCBGaWxlTm90Rm91bmRFcnJv
+cjoKICAgICAgICAgICAgICAgICBlcnJvcl9tc2cgPSAi4p2MIEVycm9yOiAn
+bm9kZScgbm90IGZvdW5kLiBFbnN1cmUgTm9kZS5qcyBpcyBpbnN0YWxsZWQg
+Zm9yIEpTIGZpbGVzLiIKICAgICAgICAgICAgICAgICBsb2dnZXIuZXJyb3Io
+ZXJyb3JfbXNnKQogICAgICAgICAgICAgICAgIGJvdC5yZXBseV90byhtZXNz
+YWdlX29ial9mb3JfcmVwbHksIGVycm9yX21zZykKICAgICAgICAgICAgICAg
+ICByZXR1cm4KICAgICAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgog
+ICAgICAgICAgICAgICAgIGxvZ2dlci5lcnJvcihmIkVycm9yIGluIEpTIHBy
+ZS1jaGVjayBmb3Ige3NjcmlwdF9rZXl9OiB7ZX0iLCBleGNfaW5mbz1UcnVl
+KQogICAgICAgICAgICAgICAgIGJvdC5yZXBseV90byhtZXNzYWdlX29ial9m
+b3JfcmVwbHksIGYi4p2MIFVuZXhwZWN0ZWQgZXJyb3IgaW4gSlMgcHJlLWNo
+ZWNrIGZvciAne2ZpbGVfbmFtZX0nOiB7ZX0iKQogICAgICAgICAgICAgICAg
+IHJldHVybgogICAgICAgICAgICBmaW5hbGx5OgogICAgICAgICAgICAgICAg
+IGlmIGNoZWNrX3Byb2MgYW5kIGNoZWNrX3Byb2MucG9sbCgpIGlzIE5vbmU6
+CiAgICAgICAgICAgICAgICAgICAgIGxvZ2dlci53YXJuaW5nKGYiSlMgQ2hl
+Y2sgcHJvY2VzcyB7Y2hlY2tfcHJvYy5waWR9IHN0aWxsIHJ1bm5pbmcuIEtp
+bGxpbmcuIikKICAgICAgICAgICAgICAgICAgICAgY2hlY2tfcHJvYy5raWxs
+KCk7IGNoZWNrX3Byb2MuY29tbXVuaWNhdGUoKQoKICAgICAgICBsb2dnZXIu
+aW5mbyhmIlN0YXJ0aW5nIGxvbmctcnVubmluZyBKUyBwcm9jZXNzIGZvciB7
+c2NyaXB0X2tleX0iKQogICAgICAgIGxvZ19maWxlX3BhdGggPSBvcy5wYXRo
+LmpvaW4odXNlcl9mb2xkZXIsIGYie29zLnBhdGguc3BsaXRleHQoZmlsZV9u
+YW1lKVswXX0ubG9nIikKICAgICAgICBsb2dfZmlsZSA9IE5vbmU7IHByb2Nl
+c3MgPSBOb25lCiAgICAgICAgdHJ5OiBsb2dfZmlsZSA9IG9wZW4obG9nX2Zp
+bGVfcGF0aCwgJ3cnLCBlbmNvZGluZz0ndXRmLTgnLCBlcnJvcnM9J2lnbm9y
+ZScpCiAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgICAg
+ICBsb2dnZXIuZXJyb3IoZiJGYWlsZWQgdG8gb3BlbiBsb2cgZmlsZSAne2xv
+Z19maWxlX3BhdGh9JyBmb3IgSlMgc2NyaXB0IHtzY3JpcHRfa2V5fToge2V9
+IiwgZXhjX2luZm89VHJ1ZSkKICAgICAgICAgICAgYm90LnJlcGx5X3RvKG1l
+c3NhZ2Vfb2JqX2Zvcl9yZXBseSwgZiLinYwgRmFpbGVkIHRvIG9wZW4gbG9n
+IGZpbGUgJ3tsb2dfZmlsZV9wYXRofSc6IHtlfSIpCiAgICAgICAgICAgIHJl
+dHVybgogICAgICAgIHRyeToKICAgICAgICAgICAgc3RhcnR1cGluZm8gPSBO
+b25lOyBjcmVhdGlvbmZsYWdzID0gMAogICAgICAgICAgICBpZiBvcy5uYW1l
+ID09ICdudCc6CiAgICAgICAgICAgICAgICAgc3RhcnR1cGluZm8gPSBzdWJw
+cm9jZXNzLlNUQVJUVVBJTkZPKCk7IHN0YXJ0dXBpbmZvLmR3RmxhZ3MgfD0g
+c3VicHJvY2Vzcy5TVEFSVEZfVVNFU0hPV1dJTkRPVwogICAgICAgICAgICAg
+ICAgIHN0YXJ0dXBpbmZvLndTaG93V2luZG93ID0gc3VicHJvY2Vzcy5TV19I
+SURFCiAgICAgICAgICAgIHByb2Nlc3MgPSBzdWJwcm9jZXNzLlBvcGVuKAog
+ICAgICAgICAgICAgICAgWydub2RlJywgc2NyaXB0X3BhdGhdLCBjd2Q9dXNl
+cl9mb2xkZXIsIHN0ZG91dD1sb2dfZmlsZSwgc3RkZXJyPWxvZ19maWxlLAog
+ICAgICAgICAgICAgICAgc3RkaW49c3VicHJvY2Vzcy5QSVBFLCBzdGFydHVw
+aW5mbz1zdGFydHVwaW5mbywgY3JlYXRpb25mbGFncz1jcmVhdGlvbmZsYWdz
+LAogICAgICAgICAgICAgICAgZW5jb2Rpbmc9J3V0Zi04JywgZXJyb3JzPSdp
+Z25vcmUnCiAgICAgICAgICAgICkKICAgICAgICAgICAgbG9nZ2VyLmluZm8o
+ZiJTdGFydGVkIEpTIHByb2Nlc3Mge3Byb2Nlc3MucGlkfSBmb3Ige3Njcmlw
+dF9rZXl9IikKICAgICAgICAgICAgYm90X3NjcmlwdHNbc2NyaXB0X2tleV0g
+PSB7CiAgICAgICAgICAgICAgICAncHJvY2Vzcyc6IHByb2Nlc3MsICdsb2df
+ZmlsZSc6IGxvZ19maWxlLCAnZmlsZV9uYW1lJzogZmlsZV9uYW1lLAogICAg
+ICAgICAgICAgICAgJ2NoYXRfaWQnOiBtZXNzYWdlX29ial9mb3JfcmVwbHku
+Y2hhdC5pZCwgIyBDaGF0IElEIGZvciBwb3RlbnRpYWwgZnV0dXJlIGRpcmVj
+dCByZXBsaWVzCiAgICAgICAgICAgICAgICAnc2NyaXB0X293bmVyX2lkJzog
+c2NyaXB0X293bmVyX2lkLCAjIEFjdHVhbCBvd25lciBvZiB0aGUgc2NyaXB0
+CiAgICAgICAgICAgICAgICAnc3RhcnRfdGltZSc6IGRhdGV0aW1lLm5vdygp
+LCAndXNlcl9mb2xkZXInOiB1c2VyX2ZvbGRlciwgJ3R5cGUnOiAnanMnLCAn
+c2NyaXB0X2tleSc6IHNjcmlwdF9rZXkKICAgICAgICAgICAgfQogICAgICAg
+ICAgICBib3QucmVwbHlfdG8obWVzc2FnZV9vYmpfZm9yX3JlcGx5LCBmIuKc
+hSBKUyBzY3JpcHQgJ3tmaWxlX25hbWV9JyBzdGFydGVkISAoUElEOiB7cHJv
+Y2Vzcy5waWR9KSAoRm9yIFVzZXI6IHtzY3JpcHRfb3duZXJfaWR9KSIpCiAg
+ICAgICAgZXhjZXB0IEZpbGVOb3RGb3VuZEVycm9yOgogICAgICAgICAgICAg
+ZXJyb3JfbXNnID0gIuKdjCBFcnJvcjogJ25vZGUnIG5vdCBmb3VuZCBmb3Ig
+bG9uZyBydW4uIEVuc3VyZSBOb2RlLmpzIGlzIGluc3RhbGxlZC4iCiAgICAg
+ICAgICAgICBsb2dnZXIuZXJyb3IoZXJyb3JfbXNnKQogICAgICAgICAgICAg
+aWYgbG9nX2ZpbGUgYW5kIG5vdCBsb2dfZmlsZS5jbG9zZWQ6IGxvZ19maWxl
+LmNsb3NlKCkKICAgICAgICAgICAgIGJvdC5yZXBseV90byhtZXNzYWdlX29i
+al9mb3JfcmVwbHksIGVycm9yX21zZykKICAgICAgICAgICAgIGlmIHNjcmlw
+dF9rZXkgaW4gYm90X3NjcmlwdHM6IGRlbCBib3Rfc2NyaXB0c1tzY3JpcHRf
+a2V5XQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICAg
+ICAgaWYgbG9nX2ZpbGUgYW5kIG5vdCBsb2dfZmlsZS5jbG9zZWQ6IGxvZ19m
+aWxlLmNsb3NlKCkKICAgICAgICAgICAgZXJyb3JfbXNnID0gZiLinYwgRXJy
+b3Igc3RhcnRpbmcgSlMgc2NyaXB0ICd7ZmlsZV9uYW1lfSc6IHtzdHIoZSl9
+IgogICAgICAgICAgICBsb2dnZXIuZXJyb3IoZXJyb3JfbXNnLCBleGNfaW5m
+bz1UcnVlKQogICAgICAgICAgICBib3QucmVwbHlfdG8obWVzc2FnZV9vYmpf
+Zm9yX3JlcGx5LCBlcnJvcl9tc2cpCiAgICAgICAgICAgIGlmIHByb2Nlc3Mg
+YW5kIHByb2Nlc3MucG9sbCgpIGlzIE5vbmU6CiAgICAgICAgICAgICAgICAg
+bG9nZ2VyLndhcm5pbmcoZiJLaWxsaW5nIHBvdGVudGlhbGx5IHN0YXJ0ZWQg
+SlMgcHJvY2VzcyB7cHJvY2Vzcy5waWR9IGZvciB7c2NyaXB0X2tleX0iKQog
+ICAgICAgICAgICAgICAgIGtpbGxfcHJvY2Vzc190cmVlKHsncHJvY2Vzcyc6
+IHByb2Nlc3MsICdsb2dfZmlsZSc6IGxvZ19maWxlLCAnc2NyaXB0X2tleSc6
+IHNjcmlwdF9rZXl9KQogICAgICAgICAgICBpZiBzY3JpcHRfa2V5IGluIGJv
+dF9zY3JpcHRzOiBkZWwgYm90X3NjcmlwdHNbc2NyaXB0X2tleV0KICAgIGV4
+Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICBlcnJvcl9tc2cgPSBmIuKd
+jCBVbmV4cGVjdGVkIGVycm9yIHJ1bm5pbmcgSlMgc2NyaXB0ICd7ZmlsZV9u
+YW1lfSc6IHtzdHIoZSl9IgogICAgICAgIGxvZ2dlci5lcnJvcihlcnJvcl9t
+c2csIGV4Y19pbmZvPVRydWUpCiAgICAgICAgYm90LnJlcGx5X3RvKG1lc3Nh
+Z2Vfb2JqX2Zvcl9yZXBseSwgZXJyb3JfbXNnKQogICAgICAgIGlmIHNjcmlw
+dF9rZXkgaW4gYm90X3NjcmlwdHM6CiAgICAgICAgICAgICBsb2dnZXIud2Fy
+bmluZyhmIkNsZWFuaW5nIHVwIHtzY3JpcHRfa2V5fSBkdWUgdG8gZXJyb3Ig
+aW4gcnVuX2pzX3NjcmlwdC4iKQogICAgICAgICAgICAga2lsbF9wcm9jZXNz
+X3RyZWUoYm90X3NjcmlwdHNbc2NyaXB0X2tleV0pCiAgICAgICAgICAgICBk
+ZWwgYm90X3NjcmlwdHNbc2NyaXB0X2tleV0KCiMgLS0tIE1hcCBUZWxlZ3Jh
+bSBpbXBvcnQgbmFtZXMgdG8gYWN0dWFsIFB5UEkgcGFja2FnZSBuYW1lcyAt
+LS0KVEVMRUdSQU1fTU9EVUxFUyA9IHsKICAgICMgTWFpbiBCb3QgRnJhbWV3
+b3JrcwogICAgJ3RlbGVib3QnOiAncHlUZWxlZ3JhbUJvdEFQSScsCiAgICAn
+dGVsZWdyYW0nOiAncHl0aG9uLXRlbGVncmFtLWJvdCcsCiAgICAncHl0aG9u
+X3RlbGVncmFtX2JvdCc6ICdweXRob24tdGVsZWdyYW0tYm90JywKICAgICdh
+aW9ncmFtJzogJ2Fpb2dyYW0nLAogICAgJ3B5cm9ncmFtJzogJ3B5cm9ncmFt
+JywKICAgICd0ZWxldGhvbic6ICd0ZWxldGhvbicsCiAgICAndGVsZXRob24u
+c3luYyc6ICd0ZWxldGhvbicsICMgSGFuZGxlIHNwZWNpZmljIGltcG9ydHMK
+ICAgICdmcm9tIHRlbGV0aG9uLnN5bmMgaW1wb3J0IHRlbGVncmFtY2xpZW50
+JzogJ3RlbGV0aG9uJywgIyBFeGFtcGxlCgogICAgIyBBZGRpdGlvbmFsIExp
+YnJhcmllcyAoYWRkIG1vcmUgc3BlY2lmaWMgbWFwcGluZ3MgaWYgaW1wb3J0
+IG5hbWUgZGlmZmVycykKICAgICd0ZWxlcG90JzogJ3RlbGVwb3QnLAogICAg
+J3B5dGcnOiAncHl0ZycsCiAgICAndGdjcnlwdG8nOiAndGdjcnlwdG8nLAog
+ICAgJ3RlbGVncmFtX3VwbG9hZCc6ICd0ZWxlZ3JhbS11cGxvYWQnLAogICAg
+J3RlbGVncmFtX3NlbmQnOiAndGVsZWdyYW0tc2VuZCcsCiAgICAndGVsZWdy
+YW1fdGV4dCc6ICd0ZWxlZ3JhbS10ZXh0JywKCiAgICAjIE1UUHJvdG8gJiBM
+b3ctTGV2ZWwKICAgICdtdHByb3RvJzogJ3RlbGVncmFtLW10cHJvdG8nLCAj
+IEV4YW1wbGUsIGNoZWNrIGFjdHVhbCBwYWNrYWdlIG5hbWUKICAgICd0bCc6
+ICd0ZWxldGhvbicsICAjIFBhcnQgb2YgVGVsZXRob24sIGluc3RhbGwgJ3Rl
+bGV0aG9uJwoKICAgICMgVXRpbGl0aWVzICYgSGVscGVycyAoZXhhbXBsZXMs
+IHZlcmlmeSBwYWNrYWdlIG5hbWVzKQogICAgJ3RlbGVncmFtX3V0aWxzJzog
+J3RlbGVncmFtLXV0aWxzJywKICAgICd0ZWxlZ3JhbV9sb2dnZXInOiAndGVs
+ZWdyYW0tbG9nZ2VyJywKICAgICd0ZWxlZ3JhbV9oYW5kbGVycyc6ICdweXRo
+b24tdGVsZWdyYW0taGFuZGxlcnMnLAoKICAgICMgRGF0YWJhc2UgSW50ZWdy
+YXRpb25zIChleGFtcGxlcykKICAgICd0ZWxlZ3JhbV9yZWRpcyc6ICd0ZWxl
+Z3JhbS1yZWRpcycsCiAgICAndGVsZWdyYW1fc3FsYWxjaGVteSc6ICd0ZWxl
+Z3JhbS1zcWxhbGNoZW15JywKCiAgICAjIFBheW1lbnQgJiBFLWNvbW1lcmNl
+IChleGFtcGxlcykKICAgICd0ZWxlZ3JhbV9wYXltZW50JzogJ3RlbGVncmFt
+LXBheW1lbnQnLAogICAgJ3RlbGVncmFtX3Nob3AnOiAndGVsZWdyYW0tc2hv
+cC1zZGsnLAoKICAgICMgVGVzdGluZyAmIERlYnVnZ2luZyAoZXhhbXBsZXMp
+CiAgICAncHl0ZXN0X3RlbGVncmFtJzogJ3B5dGVzdC10ZWxlZ3JhbScsCiAg
+ICAndGVsZWdyYW1fZGVidWcnOiAndGVsZWdyYW0tZGVidWcnLAoKICAgICMg
+U2NyYXBpbmcgJiBBbmFseXRpY3MgKGV4YW1wbGVzKQogICAgJ3RlbGVncmFt
+X3NjcmFwZXInOiAndGVsZWdyYW0tc2NyYXBlcicsCiAgICAndGVsZWdyYW1f
+YW5hbHl0aWNzJzogJ3RlbGVncmFtLWFuYWx5dGljcycsCgogICAgIyBOTFAg
+JiBBSSAoZXhhbXBsZXMpCiAgICAndGVsZWdyYW1fbmxwJzogJ3RlbGVncmFt
+LW5scC10b29sa2l0JywKICAgICd0ZWxlZ3JhbV9haSc6ICd0ZWxlZ3JhbS1h
+aScsICMgQXNzdW1pbmcgdGhpcyBleGlzdHMKCiAgICAjIFdlYiAmIEFQSSBJ
+bnRlZ3JhdGlvbiAoZXhhbXBsZXMpCiAgICAndGVsZWdyYW1fYXBpJzogJ3Rl
+bGVncmFtLWFwaS1jbGllbnQnLAogICAgJ3RlbGVncmFtX3dlYic6ICd0ZWxl
+Z3JhbS13ZWItaW50ZWdyYXRpb24nLAoKICAgICMgR2FtaW5nICYgSW50ZXJh
+Y3RpdmUgKGV4YW1wbGVzKQogICAgJ3RlbGVncmFtX2dhbWVzJzogJ3RlbGVn
+cmFtLWdhbWVzJywKICAgICd0ZWxlZ3JhbV9xdWl6JzogJ3RlbGVncmFtLXF1
+aXotYm90JywKCiAgICAjIEZpbGUgJiBNZWRpYSBIYW5kbGluZyAoZXhhbXBs
+ZXMpCiAgICAndGVsZWdyYW1fZmZtcGVnJzogJ3RlbGVncmFtLWZmbXBlZycs
+CiAgICAndGVsZWdyYW1fbWVkaWEnOiAndGVsZWdyYW0tbWVkaWEtdXRpbHMn
+LAoKICAgICMgU2VjdXJpdHkgJiBFbmNyeXB0aW9uIChleGFtcGxlcykKICAg
+ICd0ZWxlZ3JhbV8yZmEnOiAndGVsZWdyYW0tdHdvZmEnLAogICAgJ3RlbGVn
+cmFtX2NyeXB0byc6ICd0ZWxlZ3JhbS1jcnlwdG8tYm90JywKCiAgICAjIExv
+Y2FsaXphdGlvbiAmIGkxOG4gKGV4YW1wbGVzKQogICAgJ3RlbGVncmFtX2kx
+OG4nOiAndGVsZWdyYW0taTE4bicsCiAgICAndGVsZWdyYW1fdHJhbnNsYXRl
+JzogJ3RlbGVncmFtLXRyYW5zbGF0ZScsCgogICAgIyBDb21tb24gbm9uLXRl
+bGVncmFtIGV4YW1wbGVzCiAgICAnYnM0JzogJ2JlYXV0aWZ1bHNvdXA0JywK
+ICAgICdyZXF1ZXN0cyc6ICdyZXF1ZXN0cycsCiAgICAncGlsbG93JzogJ1Bp
+bGxvdycsICMgTm90ZSB0aGUgY2FwaXRhbGl6YXRpb24gZGlmZmVyZW5jZQog
+ICAgJ2N2Mic6ICdvcGVuY3YtcHl0aG9uJywgIyBDb21tb24gaW1wb3J0IG5h
+bWUgZm9yIE9wZW5DVgogICAgJ3lhbWwnOiAnUHlZQU1MJywKICAgICdkb3Rl
+bnYnOiAncHl0aG9uLWRvdGVudicsCiAgICAnZGF0ZXV0aWwnOiAncHl0aG9u
+LWRhdGV1dGlsJywKICAgICdwYW5kYXMnOiAncGFuZGFzJywKICAgICdudW1w
+eSc6ICdudW1weScsCiAgICAnZmxhc2snOiAnRmxhc2snLAogICAgJ2RqYW5n
+byc6ICdEamFuZ28nLAogICAgJ3NxbGFsY2hlbXknOiAnU1FMQWxjaGVteScs
+CiAgICAnYXN5bmNpbyc6IE5vbmUsICMgQ29yZSBtb2R1bGUsIHNob3VsZCBu
+b3QgYmUgaW5zdGFsbGVkCiAgICAnanNvbic6IE5vbmUsICAgICMgQ29yZSBt
+b2R1bGUKICAgICdkYXRldGltZSc6IE5vbmUsIyBDb3JlIG1vZHVsZQogICAg
+J29zJzogTm9uZSwgICAgICAjIENvcmUgbW9kdWxlCiAgICAnc3lzJzogTm9u
+ZSwgICAgICMgQ29yZSBtb2R1bGUKICAgICdyZSc6IE5vbmUsICAgICAgIyBD
+b3JlIG1vZHVsZQogICAgJ3RpbWUnOiBOb25lLCAgICAjIENvcmUgbW9kdWxl
+CiAgICAnbWF0aCc6IE5vbmUsICAgICMgQ29yZSBtb2R1bGUKICAgICdyYW5k
+b20nOiBOb25lLCAgIyBDb3JlIG1vZHVsZQogICAgJ2xvZ2dpbmcnOiBOb25l
+LCAjIENvcmUgbW9kdWxlCiAgICAndGhyZWFkaW5nJzogTm9uZSwjIENvcmUg
+bW9kdWxlCiAgICAnc3VicHJvY2Vzcyc6Tm9uZSwjIENvcmUgbW9kdWxlCiAg
+ICAnemlwZmlsZSc6Tm9uZSwgICMgQ29yZSBtb2R1bGUKICAgICd0ZW1wZmls
+ZSc6Tm9uZSwgIyBDb3JlIG1vZHVsZQogICAgJ3NodXRpbCc6Tm9uZSwgICAj
+IENvcmUgbW9kdWxlCiAgICAnc3FsaXRlMyc6Tm9uZSwgICMgQ29yZSBtb2R1
+bGUKICAgICdwc3V0aWwnOiAncHN1dGlsJywKICAgICdhdGV4aXQnOiBOb25l
+ICAgIyBDb3JlIG1vZHVsZQoKfQojIC0tLSBFbmQgQXV0b21hdGljIFBhY2th
+Z2UgSW5zdGFsbGF0aW9uICYgU2NyaXB0IFJ1bm5pbmcgLS0tCgoKIyAtLS0g
+RGF0YWJhc2UgT3BlcmF0aW9ucyAtLS0KREJfTE9DSyA9IHRocmVhZGluZy5M
+b2NrKCkgCgpkZWYgc2F2ZV91c2VyX2ZpbGUodXNlcl9pZCwgZmlsZV9uYW1l
+LCBmaWxlX3R5cGU9J3B5Jyk6CiAgICB3aXRoIERCX0xPQ0s6CiAgICAgICAg
+Y29ubiA9IHNxbGl0ZTMuY29ubmVjdChEQVRBQkFTRV9QQVRILCBjaGVja19z
+YW1lX3RocmVhZD1GYWxzZSkKICAgICAgICBjID0gY29ubi5jdXJzb3IoKQog
+ICAgICAgIHRyeToKICAgICAgICAgICAgYy5leGVjdXRlKCdJTlNFUlQgT1Ig
+UkVQTEFDRSBJTlRPIHVzZXJfZmlsZXMgKHVzZXJfaWQsIGZpbGVfbmFtZSwg
+ZmlsZV90eXBlKSBWQUxVRVMgKD8sID8sID8pJywKICAgICAgICAgICAgICAg
+ICAgICAgICh1c2VyX2lkLCBmaWxlX25hbWUsIGZpbGVfdHlwZSkpCiAgICAg
+ICAgICAgIGNvbm4uY29tbWl0KCkKICAgICAgICAgICAgaWYgdXNlcl9pZCBu
+b3QgaW4gdXNlcl9maWxlczogdXNlcl9maWxlc1t1c2VyX2lkXSA9IFtdCiAg
+ICAgICAgICAgIHVzZXJfZmlsZXNbdXNlcl9pZF0gPSBbKGZuLCBmdCkgZm9y
+IGZuLCBmdCBpbiB1c2VyX2ZpbGVzW3VzZXJfaWRdIGlmIGZuICE9IGZpbGVf
+bmFtZV0KICAgICAgICAgICAgdXNlcl9maWxlc1t1c2VyX2lkXS5hcHBlbmQo
+KGZpbGVfbmFtZSwgZmlsZV90eXBlKSkKICAgICAgICAgICAgbG9nZ2VyLmlu
+Zm8oZiJTYXZlZCBmaWxlICd7ZmlsZV9uYW1lfScgKHtmaWxlX3R5cGV9KSBm
+b3IgdXNlciB7dXNlcl9pZH0iKQogICAgICAgIGV4Y2VwdCBzcWxpdGUzLkVy
+cm9yIGFzIGU6IGxvZ2dlci5lcnJvcihmIuKdjCBTUUxpdGUgZXJyb3Igc2F2
+aW5nIGZpbGUgZm9yIHVzZXIge3VzZXJfaWR9LCB7ZmlsZV9uYW1lfToge2V9
+IikKICAgICAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6IGxvZ2dlci5lcnJv
+cihmIuKdjCBVbmV4cGVjdGVkIGVycm9yIHNhdmluZyBmaWxlIGZvciB7dXNl
+cl9pZH0sIHtmaWxlX25hbWV9OiB7ZX0iLCBleGNfaW5mbz1UcnVlKQogICAg
+ICAgIGZpbmFsbHk6IGNvbm4uY2xvc2UoKQoKZGVmIHJlbW92ZV91c2VyX2Zp
+bGVfZGIodXNlcl9pZCwgZmlsZV9uYW1lKToKICAgIHdpdGggREJfTE9DSzoK
+ICAgICAgICBjb25uID0gc3FsaXRlMy5jb25uZWN0KERBVEFCQVNFX1BBVEgs
+IGNoZWNrX3NhbWVfdGhyZWFkPUZhbHNlKQogICAgICAgIGMgPSBjb25uLmN1
+cnNvcigpCiAgICAgICAgdHJ5OgogICAgICAgICAgICBjLmV4ZWN1dGUoJ0RF
+TEVURSBGUk9NIHVzZXJfZmlsZXMgV0hFUkUgdXNlcl9pZCA9ID8gQU5EIGZp
+bGVfbmFtZSA9ID8nLCAodXNlcl9pZCwgZmlsZV9uYW1lKSkKICAgICAgICAg
+ICAgY29ubi5jb21taXQoKQogICAgICAgICAgICBpZiB1c2VyX2lkIGluIHVz
+ZXJfZmlsZXM6CiAgICAgICAgICAgICAgICB1c2VyX2ZpbGVzW3VzZXJfaWRd
+ID0gW2YgZm9yIGYgaW4gdXNlcl9maWxlc1t1c2VyX2lkXSBpZiBmWzBdICE9
+IGZpbGVfbmFtZV0KICAgICAgICAgICAgICAgIGlmIG5vdCB1c2VyX2ZpbGVz
+W3VzZXJfaWRdOiBkZWwgdXNlcl9maWxlc1t1c2VyX2lkXQogICAgICAgICAg
+ICBsb2dnZXIuaW5mbyhmIlJlbW92ZWQgZmlsZSAne2ZpbGVfbmFtZX0nIGZv
+ciB1c2VyIHt1c2VyX2lkfSBmcm9tIERCIikKICAgICAgICBleGNlcHQgc3Fs
+aXRlMy5FcnJvciBhcyBlOiBsb2dnZXIuZXJyb3IoZiLinYwgU1FMaXRlIGVy
+cm9yIHJlbW92aW5nIGZpbGUgZm9yIHt1c2VyX2lkfSwge2ZpbGVfbmFtZX06
+IHtlfSIpCiAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOiBsb2dnZXIu
+ZXJyb3IoZiLinYwgVW5leHBlY3RlZCBlcnJvciByZW1vdmluZyBmaWxlIGZv
+ciB7dXNlcl9pZH0sIHtmaWxlX25hbWV9OiB7ZX0iLCBleGNfaW5mbz1UcnVl
+KQogICAgICAgIGZpbmFsbHk6IGNvbm4uY2xvc2UoKQoKZGVmIGFkZF9hY3Rp
+dmVfdXNlcih1c2VyX2lkKToKICAgIGFjdGl2ZV91c2Vycy5hZGQodXNlcl9p
+ZCkgCiAgICB3aXRoIERCX0xPQ0s6CiAgICAgICAgY29ubiA9IHNxbGl0ZTMu
+Y29ubmVjdChEQVRBQkFTRV9QQVRILCBjaGVja19zYW1lX3RocmVhZD1GYWxz
+ZSkKICAgICAgICBjID0gY29ubi5jdXJzb3IoKQogICAgICAgIHRyeToKICAg
+ICAgICAgICAgYy5leGVjdXRlKCdJTlNFUlQgT1IgSUdOT1JFIElOVE8gYWN0
+aXZlX3VzZXJzICh1c2VyX2lkKSBWQUxVRVMgKD8pJywgKHVzZXJfaWQsKSkK
+ICAgICAgICAgICAgY29ubi5jb21taXQoKQogICAgICAgICAgICBsb2dnZXIu
+aW5mbyhmIkFkZGVkL0NvbmZpcm1lZCBhY3RpdmUgdXNlciB7dXNlcl9pZH0g
+aW4gREIiKQogICAgICAgIGV4Y2VwdCBzcWxpdGUzLkVycm9yIGFzIGU6IGxv
+Z2dlci5lcnJvcihmIuKdjCBTUUxpdGUgZXJyb3IgYWRkaW5nIGFjdGl2ZSB1
+c2VyIHt1c2VyX2lkfToge2V9IikKICAgICAgICBleGNlcHQgRXhjZXB0aW9u
+IGFzIGU6IGxvZ2dlci5lcnJvcihmIuKdjCBVbmV4cGVjdGVkIGVycm9yIGFk
+ZGluZyBhY3RpdmUgdXNlciB7dXNlcl9pZH06IHtlfSIsIGV4Y19pbmZvPVRy
+dWUpCiAgICAgICAgZmluYWxseTogY29ubi5jbG9zZSgpCgpkZWYgc2F2ZV9z
+dWJzY3JpcHRpb24odXNlcl9pZCwgZXhwaXJ5KToKICAgIHdpdGggREJfTE9D
+SzoKICAgICAgICBjb25uID0gc3FsaXRlMy5jb25uZWN0KERBVEFCQVNFX1BB
+VEgsIGNoZWNrX3NhbWVfdGhyZWFkPUZhbHNlKQogICAgICAgIGMgPSBjb25u
+LmN1cnNvcigpCiAgICAgICAgdHJ5OgogICAgICAgICAgICBleHBpcnlfc3Ry
+ID0gZXhwaXJ5Lmlzb2Zvcm1hdCgpCiAgICAgICAgICAgIGMuZXhlY3V0ZSgn
+SU5TRVJUIE9SIFJFUExBQ0UgSU5UTyBzdWJzY3JpcHRpb25zICh1c2VyX2lk
+LCBleHBpcnkpIFZBTFVFUyAoPywgPyknLCAodXNlcl9pZCwgZXhwaXJ5X3N0
+cikpCiAgICAgICAgICAgIGNvbm4uY29tbWl0KCkKICAgICAgICAgICAgdXNl
+cl9zdWJzY3JpcHRpb25zW3VzZXJfaWRdID0geydleHBpcnknOiBleHBpcnl9
+CiAgICAgICAgICAgIGxvZ2dlci5pbmZvKGYiU2F2ZWQgc3Vic2NyaXB0aW9u
+IGZvciB7dXNlcl9pZH0sIGV4cGlyeSB7ZXhwaXJ5X3N0cn0iKQogICAgICAg
+IGV4Y2VwdCBzcWxpdGUzLkVycm9yIGFzIGU6IGxvZ2dlci5lcnJvcihmIuKd
+jCBTUUxpdGUgZXJyb3Igc2F2aW5nIHN1YnNjcmlwdGlvbiBmb3Ige3VzZXJf
+aWR9OiB7ZX0iKQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZTogbG9n
+Z2VyLmVycm9yKGYi4p2MIFVuZXhwZWN0ZWQgZXJyb3Igc2F2aW5nIHN1YnNj
+cmlwdGlvbiBmb3Ige3VzZXJfaWR9OiB7ZX0iLCBleGNfaW5mbz1UcnVlKQog
+ICAgICAgIGZpbmFsbHk6IGNvbm4uY2xvc2UoKQoKZGVmIHJlbW92ZV9zdWJz
+Y3JpcHRpb25fZGIodXNlcl9pZCk6CiAgICB3aXRoIERCX0xPQ0s6CiAgICAg
+ICAgY29ubiA9IHNxbGl0ZTMuY29ubmVjdChEQVRBQkFTRV9QQVRILCBjaGVj
+a19zYW1lX3RocmVhZD1GYWxzZSkKICAgICAgICBjID0gY29ubi5jdXJzb3Io
+KQogICAgICAgIHRyeToKICAgICAgICAgICAgYy5leGVjdXRlKCdERUxFVEUg
+RlJPTSBzdWJzY3JpcHRpb25zIFdIRVJFIHVzZXJfaWQgPSA/JywgKHVzZXJf
+aWQsKSkKICAgICAgICAgICAgY29ubi5jb21taXQoKQogICAgICAgICAgICBp
+ZiB1c2VyX2lkIGluIHVzZXJfc3Vic2NyaXB0aW9uczogZGVsIHVzZXJfc3Vi
+c2NyaXB0aW9uc1t1c2VyX2lkXQogICAgICAgICAgICBsb2dnZXIuaW5mbyhm
+IlJlbW92ZWQgc3Vic2NyaXB0aW9uIGZvciB7dXNlcl9pZH0gZnJvbSBEQiIp
+CiAgICAgICAgZXhjZXB0IHNxbGl0ZTMuRXJyb3IgYXMgZTogbG9nZ2VyLmVy
+cm9yKGYi4p2MIFNRTGl0ZSBlcnJvciByZW1vdmluZyBzdWJzY3JpcHRpb24g
+Zm9yIHt1c2VyX2lkfToge2V9IikKICAgICAgICBleGNlcHQgRXhjZXB0aW9u
+IGFzIGU6IGxvZ2dlci5lcnJvcihmIuKdjCBVbmV4cGVjdGVkIGVycm9yIHJl
+bW92aW5nIHN1YnNjcmlwdGlvbiBmb3Ige3VzZXJfaWR9OiB7ZX0iLCBleGNf
+aW5mbz1UcnVlKQogICAgICAgIGZpbmFsbHk6IGNvbm4uY2xvc2UoKQoKZGVm
+IGFkZF9hZG1pbl9kYihhZG1pbl9pZCk6CiAgICB3aXRoIERCX0xPQ0s6CiAg
+ICAgICAgY29ubiA9IHNxbGl0ZTMuY29ubmVjdChEQVRBQkFTRV9QQVRILCBj
+aGVja19zYW1lX3RocmVhZD1GYWxzZSkKICAgICAgICBjID0gY29ubi5jdXJz
+b3IoKQogICAgICAgIHRyeToKICAgICAgICAgICAgYy5leGVjdXRlKCdJTlNF
+UlQgT1IgSUdOT1JFIElOVE8gYWRtaW5zICh1c2VyX2lkKSBWQUxVRVMgKD8p
+JywgKGFkbWluX2lkLCkpCiAgICAgICAgICAgIGNvbm4uY29tbWl0KCkKICAg
+ICAgICAgICAgYWRtaW5faWRzLmFkZChhZG1pbl9pZCkgCiAgICAgICAgICAg
+IGxvZ2dlci5pbmZvKGYiQWRkZWQgYWRtaW4ge2FkbWluX2lkfSB0byBEQiIp
+CiAgICAgICAgZXhjZXB0IHNxbGl0ZTMuRXJyb3IgYXMgZTogbG9nZ2VyLmVy
+cm9yKGYi4p2MIFNRTGl0ZSBlcnJvciBhZGRpbmcgYWRtaW4ge2FkbWluX2lk
+fToge2V9IikKICAgICAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6IGxvZ2dl
+ci5lcnJvcihmIuKdjCBVbmV4cGVjdGVkIGVycm9yIGFkZGluZyBhZG1pbiB7
+YWRtaW5faWR9OiB7ZX0iLCBleGNfaW5mbz1UcnVlKQogICAgICAgIGZpbmFs
+bHk6IGNvbm4uY2xvc2UoKQoKZGVmIHJlbW92ZV9hZG1pbl9kYihhZG1pbl9p
+ZCk6CiAgICBpZiBhZG1pbl9pZCA9PSBPV05FUl9JRDoKICAgICAgICBsb2dn
+ZXIud2FybmluZygiQXR0ZW1wdGVkIHRvIHJlbW92ZSBPV05FUl9JRCBmcm9t
+IGFkbWlucy4iKQogICAgICAgIHJldHVybiBGYWxzZSAKICAgIHdpdGggREJf
+TE9DSzoKICAgICAgICBjb25uID0gc3FsaXRlMy5jb25uZWN0KERBVEFCQVNF
+X1BBVEgsIGNoZWNrX3NhbWVfdGhyZWFkPUZhbHNlKQogICAgICAgIGMgPSBj
+b25uLmN1cnNvcigpCiAgICAgICAgcmVtb3ZlZCA9IEZhbHNlCiAgICAgICAg
+dHJ5OgogICAgICAgICAgICBjLmV4ZWN1dGUoJ1NFTEVDVCAxIEZST00gYWRt
+aW5zIFdIRVJFIHVzZXJfaWQgPSA/JywgKGFkbWluX2lkLCkpCiAgICAgICAg
+ICAgIGlmIGMuZmV0Y2hvbmUoKToKICAgICAgICAgICAgICAgIGMuZXhlY3V0
+ZSgnREVMRVRFIEZST00gYWRtaW5zIFdIRVJFIHVzZXJfaWQgPSA/JywgKGFk
+bWluX2lkLCkpCiAgICAgICAgICAgICAgICBjb25uLmNvbW1pdCgpCiAgICAg
+ICAgICAgICAgICByZW1vdmVkID0gYy5yb3djb3VudCA+IDAgCiAgICAgICAg
+ICAgICAgICBpZiByZW1vdmVkOiBhZG1pbl9pZHMuZGlzY2FyZChhZG1pbl9p
+ZCk7IGxvZ2dlci5pbmZvKGYiUmVtb3ZlZCBhZG1pbiB7YWRtaW5faWR9IGZy
+b20gREIiKQogICAgICAgICAgICAgICAgZWxzZTogbG9nZ2VyLndhcm5pbmco
+ZiJBZG1pbiB7YWRtaW5faWR9IGZvdW5kIGJ1dCBkZWxldGUgYWZmZWN0ZWQg
+MCByb3dzLiIpCiAgICAgICAgICAgIGVsc2U6CiAgICAgICAgICAgICAgICBs
+b2dnZXIud2FybmluZyhmIkFkbWluIHthZG1pbl9pZH0gbm90IGZvdW5kIGlu
+IERCLiIpCiAgICAgICAgICAgICAgICBhZG1pbl9pZHMuZGlzY2FyZChhZG1p
+bl9pZCkKICAgICAgICAgICAgcmV0dXJuIHJlbW92ZWQKICAgICAgICBleGNl
+cHQgc3FsaXRlMy5FcnJvciBhcyBlOiBsb2dnZXIuZXJyb3IoZiLinYwgU1FM
+aXRlIGVycm9yIHJlbW92aW5nIGFkbWluIHthZG1pbl9pZH06IHtlfSIpOyBy
+ZXR1cm4gRmFsc2UKICAgICAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6IGxv
+Z2dlci5lcnJvcihmIuKdjCBVbmV4cGVjdGVkIGVycm9yIHJlbW92aW5nIGFk
+bWluIHthZG1pbl9pZH06IHtlfSIsIGV4Y19pbmZvPVRydWUpOyByZXR1cm4g
+RmFsc2UKICAgICAgICBmaW5hbGx5OiBjb25uLmNsb3NlKCkKIyAtLS0gRW5k
+IERhdGFiYXNlIE9wZXJhdGlvbnMgLS0tCgojIC0tLSBNZW51IGNyZWF0aW9u
+IChJbmxpbmUgYW5kIFJlcGx5S2V5Ym9hcmRzKSAtLS0KZGVmIGNyZWF0ZV9t
+YWluX21lbnVfaW5saW5lKHVzZXJfaWQpOgogICAgbWFya3VwID0gdHlwZXMu
+SW5saW5lS2V5Ym9hcmRNYXJrdXAocm93X3dpZHRoPTIpCiAgICBidXR0b25z
+ID0gWwogICAgICAgIHR5cGVzLklubGluZUtleWJvYXJkQnV0dG9uKCfwn5Oi
+IFVwZGF0ZXMgQ2hhbm5lbCcsIHVybD1VUERBVEVfQ0hBTk5FTCksCiAgICAg
+ICAgdHlwZXMuSW5saW5lS2V5Ym9hcmRCdXR0b24oJ/Cfk6QgVXBsb2FkIEZp
+bGUnLCBjYWxsYmFja19kYXRhPSd1cGxvYWQnKSwKICAgICAgICB0eXBlcy5J
+bmxpbmVLZXlib2FyZEJ1dHRvbign8J+TgiBDaGVjayBGaWxlcycsIGNhbGxi
+YWNrX2RhdGE9J2NoZWNrX2ZpbGVzJyksCiAgICAgICAgdHlwZXMuSW5saW5l
+S2V5Ym9hcmRCdXR0b24oJ+KaoSBCb3QgU3BlZWQnLCBjYWxsYmFja19kYXRh
+PSdzcGVlZCcpLAogICAgICAgIHR5cGVzLklubGluZUtleWJvYXJkQnV0dG9u
+KCfwn5OeIENvbnRhY3QgT3duZXInLCB1cmw9ZidodHRwczovL3QubWUve1lP
+VVJfVVNFUk5BTUUucmVwbGFjZSgiQERyYXhfMXoiLCAiIil9JykKICAgIF0K
+CiAgICBpZiB1c2VyX2lkIGluIGFkbWluX2lkczoKICAgICAgICBhZG1pbl9i
+dXR0b25zID0gWwogICAgICAgICAgICB0eXBlcy5JbmxpbmVLZXlib2FyZEJ1
+dHRvbign8J+SsyBTdWJzY3JpcHRpb25zJywgY2FsbGJhY2tfZGF0YT0nc3Vi
+c2NyaXB0aW9uJyksICMwCiAgICAgICAgICAgIHR5cGVzLklubGluZUtleWJv
+YXJkQnV0dG9uKCfwn5OKIFN0YXRpc3RpY3MnLCBjYWxsYmFja19kYXRhPSdz
+dGF0cycpLCAjMQogICAgICAgICAgICB0eXBlcy5JbmxpbmVLZXlib2FyZEJ1
+dHRvbign8J+UkiBMb2NrIEJvdCcgaWYgbm90IGJvdF9sb2NrZWQgZWxzZSAn
+8J+UkyBVbmxvY2sgQm90JywgIzIKICAgICAgICAgICAgICAgICAgICAgICAg
+ICAgICAgICAgICAgIGNhbGxiYWNrX2RhdGE9J2xvY2tfYm90JyBpZiBub3Qg
+Ym90X2xvY2tlZCBlbHNlICd1bmxvY2tfYm90JyksCiAgICAgICAgICAgIHR5
+cGVzLklubGluZUtleWJvYXJkQnV0dG9uKCfwn5OiIEJyb2FkY2FzdCcsIGNh
+bGxiYWNrX2RhdGE9J2Jyb2FkY2FzdCcpLCAjMwogICAgICAgICAgICB0eXBl
+cy5JbmxpbmVLZXlib2FyZEJ1dHRvbign8J+RkSBBZG1pbiBQYW5lbCcsIGNh
+bGxiYWNrX2RhdGE9J2FkbWluX3BhbmVsJyksICM0CiAgICAgICAgICAgIHR5
+cGVzLklubGluZUtleWJvYXJkQnV0dG9uKCfwn5+iIFJ1biBBbGwgVXNlciBT
+Y3JpcHRzJywgY2FsbGJhY2tfZGF0YT0ncnVuX2FsbF9zY3JpcHRzJykgIzUK
+ICAgICAgICBdCiAgICAgICAgbWFya3VwLmFkZChidXR0b25zWzBdKSAjIFVw
+ZGF0ZXMKICAgICAgICBtYXJrdXAuYWRkKGJ1dHRvbnNbMV0sIGJ1dHRvbnNb
+Ml0pICMgVXBsb2FkLCBDaGVjayBGaWxlcwogICAgICAgIG1hcmt1cC5hZGQo
+YnV0dG9uc1szXSwgYWRtaW5fYnV0dG9uc1swXSkgIyBTcGVlZCwgU3Vic2Ny
+aXB0aW9ucwogICAgICAgIG1hcmt1cC5hZGQoYWRtaW5fYnV0dG9uc1sxXSwg
+YWRtaW5fYnV0dG9uc1szXSkgIyBTdGF0cywgQnJvYWRjYXN0CiAgICAgICAg
+bWFya3VwLmFkZChhZG1pbl9idXR0b25zWzJdLCBhZG1pbl9idXR0b25zWzVd
+KSAjIExvY2sgQm90LCBSdW4gQWxsIFNjcmlwdHMKICAgICAgICBtYXJrdXAu
+YWRkKGFkbWluX2J1dHRvbnNbNF0pICMgQWRtaW4gUGFuZWwKICAgICAgICBt
+YXJrdXAuYWRkKGJ1dHRvbnNbNF0pICMgQ29udGFjdAogICAgZWxzZToKICAg
+ICAgICBtYXJrdXAuYWRkKGJ1dHRvbnNbMF0pCiAgICAgICAgbWFya3VwLmFk
+ZChidXR0b25zWzFdLCBidXR0b25zWzJdKQogICAgICAgIG1hcmt1cC5hZGQo
+YnV0dG9uc1szXSkKICAgICAgICBtYXJrdXAuYWRkKHR5cGVzLklubGluZUtl
+eWJvYXJkQnV0dG9uKCfwn5OKIFN0YXRpc3RpY3MnLCBjYWxsYmFja19kYXRh
+PSdzdGF0cycpKSAjIEFsbG93IG5vbi1hZG1pbnMgdG8gc2VlIHN0YXRzIHRv
+bwogICAgICAgIG1hcmt1cC5hZGQoYnV0dG9uc1s0XSkKICAgIHJldHVybiBt
+YXJrdXAKCmRlZiBjcmVhdGVfcmVwbHlfa2V5Ym9hcmRfbWFpbl9tZW51KHVz
+ZXJfaWQpOgogICAgbWFya3VwID0gdHlwZXMuUmVwbHlLZXlib2FyZE1hcmt1
+cChyZXNpemVfa2V5Ym9hcmQ9VHJ1ZSwgcm93X3dpZHRoPTIpCiAgICBsYXlv
+dXRfdG9fdXNlID0gQURNSU5fQ09NTUFORF9CVVRUT05TX0xBWU9VVF9VU0VS
+X1NQRUMgaWYgdXNlcl9pZCBpbiBhZG1pbl9pZHMgZWxzZSBDT01NQU5EX0JV
+VFRPTlNfTEFZT1VUX1VTRVJfU1BFQwogICAgZm9yIHJvd19idXR0b25zX3Rl
+eHQgaW4gbGF5b3V0X3RvX3VzZToKICAgICAgICBtYXJrdXAuYWRkKCpbdHlw
+ZXMuS2V5Ym9hcmRCdXR0b24odGV4dCkgZm9yIHRleHQgaW4gcm93X2J1dHRv
+bnNfdGV4dF0pCiAgICByZXR1cm4gbWFya3VwCgpkZWYgY3JlYXRlX2NvbnRy
+b2xfYnV0dG9ucyhzY3JpcHRfb3duZXJfaWQsIGZpbGVfbmFtZSwgaXNfcnVu
+bmluZz1UcnVlKTogIyBQYXJhbWV0ZXIgcmVuYW1lZAogICAgbWFya3VwID0g
+dHlwZXMuSW5saW5lS2V5Ym9hcmRNYXJrdXAocm93X3dpZHRoPTIpCiAgICAj
+IENhbGxiYWNrcyB1c2Ugc2NyaXB0X293bmVyX2lkCiAgICBpZiBpc19ydW5u
+aW5nOgogICAgICAgIG1hcmt1cC5yb3coCiAgICAgICAgICAgIHR5cGVzLklu
+bGluZUtleWJvYXJkQnV0dG9uKCLwn5S0IFN0b3AiLCBjYWxsYmFja19kYXRh
+PWYnc3RvcF97c2NyaXB0X293bmVyX2lkfV97ZmlsZV9uYW1lfScpLAogICAg
+ICAgICAgICB0eXBlcy5JbmxpbmVLZXlib2FyZEJ1dHRvbigi8J+UhCBSZXN0
+YXJ0IiwgY2FsbGJhY2tfZGF0YT1mJ3Jlc3RhcnRfe3NjcmlwdF9vd25lcl9p
+ZH1fe2ZpbGVfbmFtZX0nKQogICAgICAgICkKICAgICAgICBtYXJrdXAucm93
+KAogICAgICAgICAgICB0eXBlcy5JbmxpbmVLZXlib2FyZEJ1dHRvbigi8J+X
+ke+4jyBEZWxldGUiLCBjYWxsYmFja19kYXRhPWYnZGVsZXRlX3tzY3JpcHRf
+b3duZXJfaWR9X3tmaWxlX25hbWV9JyksCiAgICAgICAgICAgIHR5cGVzLklu
+bGluZUtleWJvYXJkQnV0dG9uKCLwn5OcIExvZ3MiLCBjYWxsYmFja19kYXRh
+PWYnbG9nc197c2NyaXB0X293bmVyX2lkfV97ZmlsZV9uYW1lfScpCiAgICAg
+ICAgKQogICAgZWxzZToKICAgICAgICBtYXJrdXAucm93KAogICAgICAgICAg
+ICB0eXBlcy5JbmxpbmVLZXlib2FyZEJ1dHRvbigi8J+foiBTdGFydCIsIGNh
+bGxiYWNrX2RhdGE9ZidzdGFydF97c2NyaXB0X293bmVyX2lkfV97ZmlsZV9u
+YW1lfScpLAogICAgICAgICAgICB0eXBlcy5JbmxpbmVLZXlib2FyZEJ1dHRv
+bigi8J+Xke+4jyBEZWxldGUiLCBjYWxsYmFja19kYXRhPWYnZGVsZXRlX3tz
+Y3JpcHRfb3duZXJfaWR9X3tmaWxlX25hbWV9JykKICAgICAgICApCiAgICAg
+ICAgbWFya3VwLnJvdygKICAgICAgICAgICAgdHlwZXMuSW5saW5lS2V5Ym9h
+cmRCdXR0b24oIvCfk5wgVmlldyBMb2dzIiwgY2FsbGJhY2tfZGF0YT1mJ2xv
+Z3Nfe3NjcmlwdF9vd25lcl9pZH1fe2ZpbGVfbmFtZX0nKQogICAgICAgICkK
+ICAgIG1hcmt1cC5hZGQodHlwZXMuSW5saW5lS2V5Ym9hcmRCdXR0b24oIvCf
+lJkgQmFjayB0byBGaWxlcyIsIGNhbGxiYWNrX2RhdGE9J2NoZWNrX2ZpbGVz
+JykpCiAgICByZXR1cm4gbWFya3VwCgpkZWYgY3JlYXRlX2FkbWluX3BhbmVs
+KCk6CiAgICBtYXJrdXAgPSB0eXBlcy5JbmxpbmVLZXlib2FyZE1hcmt1cChy
+b3dfd2lkdGg9MikKICAgIG1hcmt1cC5yb3coCiAgICAgICAgdHlwZXMuSW5s
+aW5lS2V5Ym9hcmRCdXR0b24oJ+KelSBBZGQgQWRtaW4nLCBjYWxsYmFja19k
+YXRhPSdhZGRfYWRtaW4nKSwKICAgICAgICB0eXBlcy5JbmxpbmVLZXlib2Fy
+ZEJ1dHRvbign4p6WIFJlbW92ZSBBZG1pbicsIGNhbGxiYWNrX2RhdGE9J3Jl
+bW92ZV9hZG1pbicpCiAgICApCiAgICBtYXJrdXAucm93KHR5cGVzLklubGlu
+ZUtleWJvYXJkQnV0dG9uKCfwn5OLIExpc3QgQWRtaW5zJywgY2FsbGJhY2tf
+ZGF0YT0nbGlzdF9hZG1pbnMnKSkKICAgIG1hcmt1cC5yb3codHlwZXMuSW5s
+aW5lS2V5Ym9hcmRCdXR0b24oJ/CflJkgQmFjayB0byBNYWluJywgY2FsbGJh
+Y2tfZGF0YT0nYmFja190b19tYWluJykpCiAgICByZXR1cm4gbWFya3VwCgpk
+ZWYgY3JlYXRlX3N1YnNjcmlwdGlvbl9tZW51KCk6CiAgICBtYXJrdXAgPSB0
+eXBlcy5JbmxpbmVLZXlib2FyZE1hcmt1cChyb3dfd2lkdGg9MikKICAgIG1h
+cmt1cC5yb3coCiAgICAgICAgdHlwZXMuSW5saW5lS2V5Ym9hcmRCdXR0b24o
+J+KelSBBZGQgU3Vic2NyaXB0aW9uJywgY2FsbGJhY2tfZGF0YT0nYWRkX3N1
+YnNjcmlwdGlvbicpLAogICAgICAgIHR5cGVzLklubGluZUtleWJvYXJkQnV0
+dG9uKCfinpYgUmVtb3ZlIFN1YnNjcmlwdGlvbicsIGNhbGxiYWNrX2RhdGE9
+J3JlbW92ZV9zdWJzY3JpcHRpb24nKQogICAgKQogICAgbWFya3VwLnJvdyh0
+eXBlcy5JbmxpbmVLZXlib2FyZEJ1dHRvbign8J+UjSBDaGVjayBTdWJzY3Jp
+cHRpb24nLCBjYWxsYmFja19kYXRhPSdjaGVja19zdWJzY3JpcHRpb24nKSkK
+ICAgIG1hcmt1cC5yb3codHlwZXMuSW5saW5lS2V5Ym9hcmRCdXR0b24oJ/Cf
+lJkgQmFjayB0byBNYWluJywgY2FsbGJhY2tfZGF0YT0nYmFja190b19tYWlu
+JykpCiAgICByZXR1cm4gbWFya3VwCiMgLS0tIEVuZCBNZW51IENyZWF0aW9u
+IC0tLQoKIyAtLS0gRmlsZSBIYW5kbGluZyAtLS0KZGVmIGhhbmRsZV96aXBf
+ZmlsZShkb3dubG9hZGVkX2ZpbGVfY29udGVudCwgZmlsZV9uYW1lX3ppcCwg
+bWVzc2FnZSk6CiAgICB1c2VyX2lkID0gbWVzc2FnZS5mcm9tX3VzZXIuaWQK
+ICAgICMgY2hhdF9pZCA9IG1lc3NhZ2UuY2hhdC5pZCAjIHNjcmlwdF9vd25l
+cl9pZCAodXNlcl9pZCBoZXJlKSB3aWxsIGJlIHVzZWQgZm9yIHNjcmlwdCBr
+ZXkgY29udGV4dAogICAgdXNlcl9mb2xkZXIgPSBnZXRfdXNlcl9mb2xkZXIo
+dXNlcl9pZCkKICAgIHRlbXBfZGlyID0gTm9uZSAKICAgIHRyeToKICAgICAg
+ICB0ZW1wX2RpciA9IHRlbXBmaWxlLm1rZHRlbXAocHJlZml4PWYidXNlcl97
+dXNlcl9pZH1femlwXyIpCiAgICAgICAgbG9nZ2VyLmluZm8oZiJUZW1wIGRp
+ciBmb3IgemlwOiB7dGVtcF9kaXJ9IikKICAgICAgICB6aXBfcGF0aCA9IG9z
+LnBhdGguam9pbih0ZW1wX2RpciwgZmlsZV9uYW1lX3ppcCkKICAgICAgICB3
+aXRoIG9wZW4oemlwX3BhdGgsICd3YicpIGFzIG5ld19maWxlOiBuZXdfZmls
+ZS53cml0ZShkb3dubG9hZGVkX2ZpbGVfY29udGVudCkKICAgICAgICB3aXRo
+IHppcGZpbGUuWmlwRmlsZSh6aXBfcGF0aCwgJ3InKSBhcyB6aXBfcmVmOgog
+ICAgICAgICAgICBmb3IgbWVtYmVyIGluIHppcF9yZWYuaW5mb2xpc3QoKToK
+ICAgICAgICAgICAgICAgIG1lbWJlcl9wYXRoID0gb3MucGF0aC5hYnNwYXRo
+KG9zLnBhdGguam9pbih0ZW1wX2RpciwgbWVtYmVyLmZpbGVuYW1lKSkKICAg
+ICAgICAgICAgICAgIGlmIG5vdCBtZW1iZXJfcGF0aC5zdGFydHN3aXRoKG9z
+LnBhdGguYWJzcGF0aCh0ZW1wX2RpcikpOgogICAgICAgICAgICAgICAgICAg
+IHJhaXNlIHppcGZpbGUuQmFkWmlwRmlsZShmIlppcCBoYXMgdW5zYWZlIHBh
+dGg6IHttZW1iZXIuZmlsZW5hbWV9IikKICAgICAgICAgICAgemlwX3JlZi5l
+eHRyYWN0YWxsKHRlbXBfZGlyKQogICAgICAgICAgICBsb2dnZXIuaW5mbyhm
+IkV4dHJhY3RlZCB6aXAgdG8ge3RlbXBfZGlyfSIpCgogICAgICAgIGV4dHJh
+Y3RlZF9pdGVtcyA9IG9zLmxpc3RkaXIodGVtcF9kaXIpCiAgICAgICAgcHlf
+ZmlsZXMgPSBbZiBmb3IgZiBpbiBleHRyYWN0ZWRfaXRlbXMgaWYgZi5lbmRz
+d2l0aCgnLnB5JyldCiAgICAgICAganNfZmlsZXMgPSBbZiBmb3IgZiBpbiBl
+eHRyYWN0ZWRfaXRlbXMgaWYgZi5lbmRzd2l0aCgnLmpzJyldCiAgICAgICAg
+cmVxX2ZpbGUgPSAncmVxdWlyZW1lbnRzLnR4dCcgaWYgJ3JlcXVpcmVtZW50
+cy50eHQnIGluIGV4dHJhY3RlZF9pdGVtcyBlbHNlIE5vbmUKICAgICAgICBw
+a2dfanNvbiA9ICdwYWNrYWdlLmpzb24nIGlmICdwYWNrYWdlLmpzb24nIGlu
+IGV4dHJhY3RlZF9pdGVtcyBlbHNlIE5vbmUKCiAgICAgICAgaWYgcmVxX2Zp
+bGU6CiAgICAgICAgICAgIHJlcV9wYXRoID0gb3MucGF0aC5qb2luKHRlbXBf
+ZGlyLCByZXFfZmlsZSkKICAgICAgICAgICAgbG9nZ2VyLmluZm8oZiJyZXF1
+aXJlbWVudHMudHh0IGZvdW5kLCBpbnN0YWxsaW5nOiB7cmVxX3BhdGh9IikK
+ICAgICAgICAgICAgYm90LnJlcGx5X3RvKG1lc3NhZ2UsIGYi8J+UhCBJbnN0
+YWxsaW5nIFB5dGhvbiBkZXBzIGZyb20gYHtyZXFfZmlsZX1gLi4uIikKICAg
+ICAgICAgICAgdHJ5OgogICAgICAgICAgICAgICAgY29tbWFuZCA9IFtzeXMu
+ZXhlY3V0YWJsZSwgJy1tJywgJ3BpcCcsICdpbnN0YWxsJywgJy1yJywgcmVx
+X3BhdGhdCiAgICAgICAgICAgICAgICByZXN1bHQgPSBzdWJwcm9jZXNzLnJ1
+bihjb21tYW5kLCBjYXB0dXJlX291dHB1dD1UcnVlLCB0ZXh0PVRydWUsIGNo
+ZWNrPVRydWUsIGVuY29kaW5nPSd1dGYtOCcsIGVycm9ycz0naWdub3JlJykK
+ICAgICAgICAgICAgICAgIGxvZ2dlci5pbmZvKGYicGlwIGluc3RhbGwgZnJv
+bSByZXF1aXJlbWVudHMudHh0IE9LLiBPdXRwdXQ6XG57cmVzdWx0LnN0ZG91
+dH0iKQogICAgICAgICAgICAgICAgYm90LnJlcGx5X3RvKG1lc3NhZ2UsIGYi
+4pyFIFB5dGhvbiBkZXBzIGZyb20gYHtyZXFfZmlsZX1gIGluc3RhbGxlZC4i
+KQogICAgICAgICAgICBleGNlcHQgc3VicHJvY2Vzcy5DYWxsZWRQcm9jZXNz
+RXJyb3IgYXMgZToKICAgICAgICAgICAgICAgIGVycm9yX21zZyA9IGYi4p2M
+IEZhaWxlZCB0byBpbnN0YWxsIFB5dGhvbiBkZXBzIGZyb20gYHtyZXFfZmls
+ZX1gLlxuTG9nOlxuYGBgXG57ZS5zdGRlcnIgb3IgZS5zdGRvdXR9XG5gYGAi
+CiAgICAgICAgICAgICAgICBsb2dnZXIuZXJyb3IoZXJyb3JfbXNnKQogICAg
+ICAgICAgICAgICAgaWYgbGVuKGVycm9yX21zZykgPiA0MDAwOiBlcnJvcl9t
+c2cgPSBlcnJvcl9tc2dbOjQwMDBdICsgIlxuLi4uIChMb2cgdHJ1bmNhdGVk
+KSIKICAgICAgICAgICAgICAgIGJvdC5yZXBseV90byhtZXNzYWdlLCBlcnJv
+cl9tc2csIHBhcnNlX21vZGU9J01hcmtkb3duJyk7IHJldHVybgogICAgICAg
+ICAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6CiAgICAgICAgICAgICAgICAg
+ZXJyb3JfbXNnID0gZiLinYwgVW5leHBlY3RlZCBlcnJvciBpbnN0YWxsaW5n
+IFB5dGhvbiBkZXBzOiB7ZX0iCiAgICAgICAgICAgICAgICAgbG9nZ2VyLmVy
+cm9yKGVycm9yX21zZywgZXhjX2luZm89VHJ1ZSk7IGJvdC5yZXBseV90byht
+ZXNzYWdlLCBlcnJvcl9tc2cpOyByZXR1cm4KCiAgICAgICAgaWYgcGtnX2pz
+b246CiAgICAgICAgICAgIGxvZ2dlci5pbmZvKGYicGFja2FnZS5qc29uIGZv
+dW5kLCBucG0gaW5zdGFsbCBpbjoge3RlbXBfZGlyfSIpCiAgICAgICAgICAg
+IGJvdC5yZXBseV90byhtZXNzYWdlLCBmIvCflIQgSW5zdGFsbGluZyBOb2Rl
+IGRlcHMgZnJvbSBge3BrZ19qc29ufWAuLi4iKQogICAgICAgICAgICB0cnk6
+CiAgICAgICAgICAgICAgICBjb21tYW5kID0gWyducG0nLCAnaW5zdGFsbCdd
+CiAgICAgICAgICAgICAgICByZXN1bHQgPSBzdWJwcm9jZXNzLnJ1bihjb21t
+YW5kLCBjYXB0dXJlX291dHB1dD1UcnVlLCB0ZXh0PVRydWUsIGNoZWNrPVRy
+dWUsIGN3ZD10ZW1wX2RpciwgZW5jb2Rpbmc9J3V0Zi04JywgZXJyb3JzPSdp
+Z25vcmUnKQogICAgICAgICAgICAgICAgbG9nZ2VyLmluZm8oZiJucG0gaW5z
+dGFsbCBPSy4gT3V0cHV0Olxue3Jlc3VsdC5zdGRvdXR9IikKICAgICAgICAg
+ICAgICAgIGJvdC5yZXBseV90byhtZXNzYWdlLCBmIuKchSBOb2RlIGRlcHMg
+ZnJvbSBge3BrZ19qc29ufWAgaW5zdGFsbGVkLiIpCiAgICAgICAgICAgIGV4
+Y2VwdCBGaWxlTm90Rm91bmRFcnJvcjoKICAgICAgICAgICAgICAgIGJvdC5y
+ZXBseV90byhtZXNzYWdlLCAi4p2MICducG0nIG5vdCBmb3VuZC4gQ2Fubm90
+IGluc3RhbGwgTm9kZSBkZXBzLiIpOyByZXR1cm4gCiAgICAgICAgICAgIGV4
+Y2VwdCBzdWJwcm9jZXNzLkNhbGxlZFByb2Nlc3NFcnJvciBhcyBlOgogICAg
+ICAgICAgICAgICAgZXJyb3JfbXNnID0gZiLinYwgRmFpbGVkIHRvIGluc3Rh
+bGwgTm9kZSBkZXBzIGZyb20gYHtwa2dfanNvbn1gLlxuTG9nOlxuYGBgXG57
+ZS5zdGRlcnIgb3IgZS5zdGRvdXR9XG5gYGAiCiAgICAgICAgICAgICAgICBs
+b2dnZXIuZXJyb3IoZXJyb3JfbXNnKQogICAgICAgICAgICAgICAgaWYgbGVu
+KGVycm9yX21zZykgPiA0MDAwOiBlcnJvcl9tc2cgPSBlcnJvcl9tc2dbOjQw
+MDBdICsgIlxuLi4uIChMb2cgdHJ1bmNhdGVkKSIKICAgICAgICAgICAgICAg
+IGJvdC5yZXBseV90byhtZXNzYWdlLCBlcnJvcl9tc2csIHBhcnNlX21vZGU9
+J01hcmtkb3duJyk7IHJldHVybgogICAgICAgICAgICBleGNlcHQgRXhjZXB0
+aW9uIGFzIGU6CiAgICAgICAgICAgICAgICAgZXJyb3JfbXNnID0gZiLinYwg
+VW5leHBlY3RlZCBlcnJvciBpbnN0YWxsaW5nIE5vZGUgZGVwczoge2V9Igog
+ICAgICAgICAgICAgICAgIGxvZ2dlci5lcnJvcihlcnJvcl9tc2csIGV4Y19p
+bmZvPVRydWUpOyBib3QucmVwbHlfdG8obWVzc2FnZSwgZXJyb3JfbXNnKTsg
+cmV0dXJuCgogICAgICAgIG1haW5fc2NyaXB0X25hbWUgPSBOb25lOyBmaWxl
+X3R5cGUgPSBOb25lCiAgICAgICAgcHJlZmVycmVkX3B5ID0gWydtYWluLnB5
+JywgJ2JvdC5weScsICdhcHAucHknXTsgcHJlZmVycmVkX2pzID0gWydpbmRl
+eC5qcycsICdtYWluLmpzJywgJ2JvdC5qcycsICdhcHAuanMnXQogICAgICAg
+IGZvciBwIGluIHByZWZlcnJlZF9weToKICAgICAgICAgICAgaWYgcCBpbiBw
+eV9maWxlczogbWFpbl9zY3JpcHRfbmFtZSA9IHA7IGZpbGVfdHlwZSA9ICdw
+eSc7IGJyZWFrCiAgICAgICAgaWYgbm90IG1haW5fc2NyaXB0X25hbWU6CiAg
+ICAgICAgICAgICBmb3IgcCBpbiBwcmVmZXJyZWRfanM6CiAgICAgICAgICAg
+ICAgICAgaWYgcCBpbiBqc19maWxlczogbWFpbl9zY3JpcHRfbmFtZSA9IHA7
+IGZpbGVfdHlwZSA9ICdqcyc7IGJyZWFrCiAgICAgICAgaWYgbm90IG1haW5f
+c2NyaXB0X25hbWU6CiAgICAgICAgICAgIGlmIHB5X2ZpbGVzOiBtYWluX3Nj
+cmlwdF9uYW1lID0gcHlfZmlsZXNbMF07IGZpbGVfdHlwZSA9ICdweScKICAg
+ICAgICAgICAgZWxpZiBqc19maWxlczogbWFpbl9zY3JpcHRfbmFtZSA9IGpz
+X2ZpbGVzWzBdOyBmaWxlX3R5cGUgPSAnanMnCiAgICAgICAgaWYgbm90IG1h
+aW5fc2NyaXB0X25hbWU6CiAgICAgICAgICAgIGJvdC5yZXBseV90byhtZXNz
+YWdlLCAi4p2MIE5vIGAucHlgIG9yIGAuanNgIHNjcmlwdCBmb3VuZCBpbiBh
+cmNoaXZlISIpOyByZXR1cm4KCiAgICAgICAgbG9nZ2VyLmluZm8oZiJNb3Zp
+bmcgZXh0cmFjdGVkIGZpbGVzIGZyb20ge3RlbXBfZGlyfSB0byB7dXNlcl9m
+b2xkZXJ9IikKICAgICAgICBtb3ZlZF9jb3VudCA9IDAKICAgICAgICBmb3Ig
+aXRlbV9uYW1lIGluIG9zLmxpc3RkaXIodGVtcF9kaXIpOgogICAgICAgICAg
+ICBzcmNfcGF0aCA9IG9zLnBhdGguam9pbih0ZW1wX2RpciwgaXRlbV9uYW1l
+KQogICAgICAgICAgICBkZXN0X3BhdGggPSBvcy5wYXRoLmpvaW4odXNlcl9m
+b2xkZXIsIGl0ZW1fbmFtZSkKICAgICAgICAgICAgaWYgb3MucGF0aC5pc2Rp
+cihkZXN0X3BhdGgpOiBzaHV0aWwucm10cmVlKGRlc3RfcGF0aCkKICAgICAg
+ICAgICAgZWxpZiBvcy5wYXRoLmV4aXN0cyhkZXN0X3BhdGgpOiBvcy5yZW1v
+dmUoZGVzdF9wYXRoKQogICAgICAgICAgICBzaHV0aWwubW92ZShzcmNfcGF0
+aCwgZGVzdF9wYXRoKTsgbW92ZWRfY291bnQgKz0xCiAgICAgICAgbG9nZ2Vy
+LmluZm8oZiJNb3ZlZCB7bW92ZWRfY291bnR9IGl0ZW1zIHRvIHt1c2VyX2Zv
+bGRlcn0iKQoKICAgICAgICBzYXZlX3VzZXJfZmlsZSh1c2VyX2lkLCBtYWlu
+X3NjcmlwdF9uYW1lLCBmaWxlX3R5cGUpCiAgICAgICAgbG9nZ2VyLmluZm8o
+ZiJTYXZlZCBtYWluIHNjcmlwdCAne21haW5fc2NyaXB0X25hbWV9JyAoe2Zp
+bGVfdHlwZX0pIGZvciB7dXNlcl9pZH0gZnJvbSB6aXAuIikKICAgICAgICBt
+YWluX3NjcmlwdF9wYXRoID0gb3MucGF0aC5qb2luKHVzZXJfZm9sZGVyLCBt
+YWluX3NjcmlwdF9uYW1lKQogICAgICAgIGJvdC5yZXBseV90byhtZXNzYWdl
+LCBmIuKchSBGaWxlcyBleHRyYWN0ZWQuIFN0YXJ0aW5nIG1haW4gc2NyaXB0
+OiBge21haW5fc2NyaXB0X25hbWV9YC4uLiIsIHBhcnNlX21vZGU9J01hcmtk
+b3duJykKCiAgICAgICAgIyBVc2UgdXNlcl9pZCBhcyBzY3JpcHRfb3duZXJf
+aWQgZm9yIHNjcmlwdCBrZXkgY29udGV4dAogICAgICAgIGlmIGZpbGVfdHlw
+ZSA9PSAncHknOgogICAgICAgICAgICAgdGhyZWFkaW5nLlRocmVhZCh0YXJn
+ZXQ9cnVuX3NjcmlwdCwgYXJncz0obWFpbl9zY3JpcHRfcGF0aCwgdXNlcl9p
+ZCwgdXNlcl9mb2xkZXIsIG1haW5fc2NyaXB0X25hbWUsIG1lc3NhZ2UpKS5z
+dGFydCgpCiAgICAgICAgZWxpZiBmaWxlX3R5cGUgPT0gJ2pzJzoKICAgICAg
+ICAgICAgIHRocmVhZGluZy5UaHJlYWQodGFyZ2V0PXJ1bl9qc19zY3JpcHQs
+IGFyZ3M9KG1haW5fc2NyaXB0X3BhdGgsIHVzZXJfaWQsIHVzZXJfZm9sZGVy
+LCBtYWluX3NjcmlwdF9uYW1lLCBtZXNzYWdlKSkuc3RhcnQoKQoKICAgIGV4
+Y2VwdCB6aXBmaWxlLkJhZFppcEZpbGUgYXMgZToKICAgICAgICBsb2dnZXIu
+ZXJyb3IoZiJCYWQgemlwIGZpbGUgZnJvbSB7dXNlcl9pZH06IHtlfSIpCiAg
+ICAgICAgYm90LnJlcGx5X3RvKG1lc3NhZ2UsIGYi4p2MIEVycm9yOiBJbnZh
+bGlkL2NvcnJ1cHRlZCBaSVAuIHtlfSIpCiAgICBleGNlcHQgRXhjZXB0aW9u
+IGFzIGU6CiAgICAgICAgbG9nZ2VyLmVycm9yKGYi4p2MIEVycm9yIHByb2Nl
+c3NpbmcgemlwIGZvciB7dXNlcl9pZH06IHtlfSIsIGV4Y19pbmZvPVRydWUp
+CiAgICAgICAgYm90LnJlcGx5X3RvKG1lc3NhZ2UsIGYi4p2MIEVycm9yIHBy
+b2Nlc3NpbmcgemlwOiB7c3RyKGUpfSIpCiAgICBmaW5hbGx5OgogICAgICAg
+IGlmIHRlbXBfZGlyIGFuZCBvcy5wYXRoLmV4aXN0cyh0ZW1wX2Rpcik6CiAg
+ICAgICAgICAgIHRyeTogc2h1dGlsLnJtdHJlZSh0ZW1wX2Rpcik7IGxvZ2dl
+ci5pbmZvKGYiQ2xlYW5lZCB0ZW1wIGRpcjoge3RlbXBfZGlyfSIpCiAgICAg
+ICAgICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZTogbG9nZ2VyLmVycm9yKGYi
+RmFpbGVkIHRvIGNsZWFuIHRlbXAgZGlyIHt0ZW1wX2Rpcn06IHtlfSIsIGV4
+Y19pbmZvPVRydWUpCgpkZWYgaGFuZGxlX2pzX2ZpbGUoZmlsZV9wYXRoLCBz
+Y3JpcHRfb3duZXJfaWQsIHVzZXJfZm9sZGVyLCBmaWxlX25hbWUsIG1lc3Nh
+Z2UpOgogICAgdHJ5OgogICAgICAgIHNhdmVfdXNlcl9maWxlKHNjcmlwdF9v
+d25lcl9pZCwgZmlsZV9uYW1lLCAnanMnKQogICAgICAgIHRocmVhZGluZy5U
+aHJlYWQodGFyZ2V0PXJ1bl9qc19zY3JpcHQsIGFyZ3M9KGZpbGVfcGF0aCwg
+c2NyaXB0X293bmVyX2lkLCB1c2VyX2ZvbGRlciwgZmlsZV9uYW1lLCBtZXNz
+YWdlKSkuc3RhcnQoKQogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAg
+ICAgIGxvZ2dlci5lcnJvcihmIuKdjCBFcnJvciBwcm9jZXNzaW5nIEpTIGZp
+bGUge2ZpbGVfbmFtZX0gZm9yIHtzY3JpcHRfb3duZXJfaWR9OiB7ZX0iLCBl
+eGNfaW5mbz1UcnVlKQogICAgICAgIGJvdC5yZXBseV90byhtZXNzYWdlLCBm
+IuKdjCBFcnJvciBwcm9jZXNzaW5nIEpTIGZpbGU6IHtzdHIoZSl9IikKCmRl
+ZiBoYW5kbGVfcHlfZmlsZShmaWxlX3BhdGgsIHNjcmlwdF9vd25lcl9pZCwg
+dXNlcl9mb2xkZXIsIGZpbGVfbmFtZSwgbWVzc2FnZSk6CiAgICB0cnk6CiAg
+ICAgICAgc2F2ZV91c2VyX2ZpbGUoc2NyaXB0X293bmVyX2lkLCBmaWxlX25h
+bWUsICdweScpCiAgICAgICAgdGhyZWFkaW5nLlRocmVhZCh0YXJnZXQ9cnVu
+X3NjcmlwdCwgYXJncz0oZmlsZV9wYXRoLCBzY3JpcHRfb3duZXJfaWQsIHVz
+ZXJfZm9sZGVyLCBmaWxlX25hbWUsIG1lc3NhZ2UpKS5zdGFydCgpCiAgICBl
+eGNlcHQgRXhjZXB0aW9uIGFzIGU6CiAgICAgICAgbG9nZ2VyLmVycm9yKGYi
+4p2MIEVycm9yIHByb2Nlc3NpbmcgUHl0aG9uIGZpbGUge2ZpbGVfbmFtZX0g
+Zm9yIHtzY3JpcHRfb3duZXJfaWR9OiB7ZX0iLCBleGNfaW5mbz1UcnVlKQog
+ICAgICAgIGJvdC5yZXBseV90byhtZXNzYWdlLCBmIuKdjCBFcnJvciBwcm9j
+ZXNzaW5nIFB5dGhvbiBmaWxlOiB7c3RyKGUpfSIpCiMgLS0tIEVuZCBGaWxl
+IEhhbmRsaW5nIC0tLQoKCiMgLS0tIExvZ2ljIEZ1bmN0aW9ucyAoY2FsbGVk
+IGJ5IGNvbW1hbmRzIGFuZCB0ZXh0IGhhbmRsZXJzKSAtLS0KZGVmIF9sb2dp
+Y19zZW5kX3dlbGNvbWUobWVzc2FnZSk6CiAgICB1c2VyX2lkID0gbWVzc2Fn
+ZS5mcm9tX3VzZXIuaWQKICAgIGNoYXRfaWQgPSBtZXNzYWdlLmNoYXQuaWQK
+ICAgIHVzZXJfbmFtZSA9IG1lc3NhZ2UuZnJvbV91c2VyLmZpcnN0X25hbWUK
+ICAgIHVzZXJfdXNlcm5hbWUgPSBtZXNzYWdlLmZyb21fdXNlci51c2VybmFt
+ZQoKICAgIGxvZ2dlci5pbmZvKGYiV2VsY29tZSByZXF1ZXN0IGZyb20gdXNl
+cl9pZDoge3VzZXJfaWR9LCB1c2VybmFtZTogQHt1c2VyX3VzZXJuYW1lfSIp
+CgogICAgaWYgYm90X2xvY2tlZCBhbmQgdXNlcl9pZCBub3QgaW4gYWRtaW5f
+aWRzOgogICAgICAgIGJvdC5zZW5kX21lc3NhZ2UoY2hhdF9pZCwgIuKaoO+4
+jyBCb3QgbG9ja2VkIGJ5IGFkbWluLiBUcnkgbGF0ZXIuIikKICAgICAgICBy
+ZXR1cm4KCiAgICB1c2VyX2JpbyA9ICJDb3VsZCBub3QgZmV0Y2ggYmlvIjsg
+cGhvdG9fZmlsZV9pZCA9IE5vbmUKICAgIHRyeTogdXNlcl9iaW8gPSBib3Qu
+Z2V0X2NoYXQodXNlcl9pZCkuYmlvIG9yICJObyBiaW8iCiAgICBleGNlcHQg
+RXhjZXB0aW9uOiBwYXNzCiAgICB0cnk6CiAgICAgICAgdXNlcl9wcm9maWxl
+X3Bob3RvcyA9IGJvdC5nZXRfdXNlcl9wcm9maWxlX3Bob3Rvcyh1c2VyX2lk
+LCBsaW1pdD0xKQogICAgICAgIGlmIHVzZXJfcHJvZmlsZV9waG90b3MucGhv
+dG9zOiBwaG90b19maWxlX2lkID0gdXNlcl9wcm9maWxlX3Bob3Rvcy5waG90
+b3NbMF1bLTFdLmZpbGVfaWQKICAgIGV4Y2VwdCBFeGNlcHRpb246IHBhc3MK
+CiAgICBpZiB1c2VyX2lkIG5vdCBpbiBhY3RpdmVfdXNlcnM6CiAgICAgICAg
+YWRkX2FjdGl2ZV91c2VyKHVzZXJfaWQpCiAgICAgICAgdHJ5OgogICAgICAg
+ICAgICBvd25lcl9ub3RpZmljYXRpb24gPSAoZiLwn46JIE5ldyB1c2VyIVxu
+8J+RpCBOYW1lOiB7dXNlcl9uYW1lfVxu4pyz77iPIFVzZXI6IEB7dXNlcl91
+c2VybmFtZSBvciAnTi9BJ31cbiIKICAgICAgICAgICAgICAgICAgICAgICAg
+ICAgICAgICAgIGYi8J+GlCBJRDogYHt1c2VyX2lkfWBcbvCfk50gQmlvOiB7
+dXNlcl9iaW99IikKICAgICAgICAgICAgYm90LnNlbmRfbWVzc2FnZShPV05F
+Ul9JRCwgb3duZXJfbm90aWZpY2F0aW9uLCBwYXJzZV9tb2RlPSdNYXJrZG93
+bicpCiAgICAgICAgICAgIGlmIHBob3RvX2ZpbGVfaWQ6IGJvdC5zZW5kX3Bo
+b3RvKE9XTkVSX0lELCBwaG90b19maWxlX2lkLCBjYXB0aW9uPWYiUGljIG9m
+IG5ldyB1c2VyIHt1c2VyX2lkfSIpCiAgICAgICAgZXhjZXB0IEV4Y2VwdGlv
+biBhcyBlOiBsb2dnZXIuZXJyb3IoZiLimqDvuI8gRmFpbGVkIHRvIG5vdGlm
+eSBvd25lciBhYm91dCBuZXcgdXNlciB7dXNlcl9pZH06IHtlfSIpCgogICAg
+ZmlsZV9saW1pdCA9IGdldF91c2VyX2ZpbGVfbGltaXQodXNlcl9pZCkKICAg
+IGN1cnJlbnRfZmlsZXMgPSBnZXRfdXNlcl9maWxlX2NvdW50KHVzZXJfaWQp
+CiAgICBsaW1pdF9zdHIgPSBzdHIoZmlsZV9saW1pdCkgaWYgZmlsZV9saW1p
+dCAhPSBmbG9hdCgnaW5mJykgZWxzZSAiVW5saW1pdGVkIgogICAgZXhwaXJ5
+X2luZm8gPSAiIgogICAgaWYgdXNlcl9pZCA9PSBPV05FUl9JRDogdXNlcl9z
+dGF0dXMgPSAi8J+RkSBPd25lciIKICAgIGVsaWYgdXNlcl9pZCBpbiBhZG1p
+bl9pZHM6IHVzZXJfc3RhdHVzID0gIvCfm6HvuI8gQWRtaW4iCiAgICBlbGlm
+IHVzZXJfaWQgaW4gdXNlcl9zdWJzY3JpcHRpb25zOgogICAgICAgIGV4cGly
+eV9kYXRlID0gdXNlcl9zdWJzY3JpcHRpb25zW3VzZXJfaWRdLmdldCgnZXhw
+aXJ5JykKICAgICAgICBpZiBleHBpcnlfZGF0ZSBhbmQgZXhwaXJ5X2RhdGUg
+PiBkYXRldGltZS5ub3coKToKICAgICAgICAgICAgdXNlcl9zdGF0dXMgPSAi
+4q2QIFByZW1pdW0iOyBkYXlzX2xlZnQgPSAoZXhwaXJ5X2RhdGUgLSBkYXRl
+dGltZS5ub3coKSkuZGF5cwogICAgICAgICAgICBleHBpcnlfaW5mbyA9IGYi
+XG7ij7MgU3Vic2NyaXB0aW9uIGV4cGlyZXMgaW46IHtkYXlzX2xlZnR9IGRh
+eXMiCiAgICAgICAgZWxzZTogdXNlcl9zdGF0dXMgPSAi8J+GkyBGcmVlIFVz
+ZXIgKEV4cGlyZWQgU3ViKSI7IHJlbW92ZV9zdWJzY3JpcHRpb25fZGIodXNl
+cl9pZCkgIyBDbGVhbiB1cCBleHBpcmVkCiAgICBlbHNlOiB1c2VyX3N0YXR1
+cyA9ICLwn4aTIEZyZWUgVXNlciIKCiAgICB3ZWxjb21lX21zZ190ZXh0ID0g
+KGYi44C977iPIFdlbGNvbWUsIHt1c2VyX25hbWV9IVxuXG7wn4aUIFlvdXIg
+VXNlciBJRDogYHt1c2VyX2lkfWBcbiIKICAgICAgICAgICAgICAgICAgICAg
+ICAgZiLinLPvuI8gVXNlcm5hbWU6IGBAe3VzZXJfdXNlcm5hbWUgb3IgJ05v
+dCBzZXQnfWBcbiIKICAgICAgICAgICAgICAgICAgICAgICAgZiLwn5SwIFlv
+dXIgU3RhdHVzOiB7dXNlcl9zdGF0dXN9e2V4cGlyeV9pbmZvfVxuIgogICAg
+ICAgICAgICAgICAgICAgICAgICBmIvCfk4EgRmlsZXMgVXBsb2FkZWQ6IHtj
+dXJyZW50X2ZpbGVzfSAvIHtsaW1pdF9zdHJ9XG5cbiIKICAgICAgICAgICAg
+ICAgICAgICAgICAgZiLwn6SWIEhvc3QgJiBydW4gUHl0aG9uIChgLnB5YCkg
+b3IgSlMgKGAuanNgKSBzY3JpcHRzLlxuIgogICAgICAgICAgICAgICAgICAg
+ICAgICBmIiAgIFVwbG9hZCBzaW5nbGUgc2NyaXB0cyBvciBgLnppcGAgYXJj
+aGl2ZXMuXG5cbiIKICAgICAgICAgICAgICAgICAgICAgICAgZiLwn5GHIFVz
+ZSBidXR0b25zIG9yIHR5cGUgY29tbWFuZHMuIikKICAgIG1haW5fcmVwbHlf
+bWFya3VwID0gY3JlYXRlX3JlcGx5X2tleWJvYXJkX21haW5fbWVudSh1c2Vy
+X2lkKQogICAgdHJ5OgogICAgICAgIGlmIHBob3RvX2ZpbGVfaWQ6IGJvdC5z
+ZW5kX3Bob3RvKGNoYXRfaWQsIHBob3RvX2ZpbGVfaWQpCiAgICAgICAgYm90
+LnNlbmRfbWVzc2FnZShjaGF0X2lkLCB3ZWxjb21lX21zZ190ZXh0LCByZXBs
+eV9tYXJrdXA9bWFpbl9yZXBseV9tYXJrdXAsIHBhcnNlX21vZGU9J01hcmtk
+b3duJykKICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICBsb2dn
+ZXIuZXJyb3IoZiJFcnJvciBzZW5kaW5nIHdlbGNvbWUgdG8ge3VzZXJfaWR9
+OiB7ZX0iLCBleGNfaW5mbz1UcnVlKQogICAgICAgIHRyeTogYm90LnNlbmRf
+bWVzc2FnZShjaGF0X2lkLCB3ZWxjb21lX21zZ190ZXh0LCByZXBseV9tYXJr
+dXA9bWFpbl9yZXBseV9tYXJrdXAsIHBhcnNlX21vZGU9J01hcmtkb3duJykg
+IyBGYWxsYmFjayB3aXRob3V0IHBob3RvCiAgICAgICAgZXhjZXB0IEV4Y2Vw
+dGlvbiBhcyBmYWxsYmFja19lOiBsb2dnZXIuZXJyb3IoZiJGYWxsYmFjayBz
+ZW5kX21lc3NhZ2UgZmFpbGVkIGZvciB7dXNlcl9pZH06IHtmYWxsYmFja19l
+fSIpCgpkZWYgX2xvZ2ljX3VwZGF0ZXNfY2hhbm5lbChtZXNzYWdlKToKICAg
+IG1hcmt1cCA9IHR5cGVzLklubGluZUtleWJvYXJkTWFya3VwKCkKICAgIG1h
+cmt1cC5hZGQodHlwZXMuSW5saW5lS2V5Ym9hcmRCdXR0b24oJ/Cfk6IgVXBk
+YXRlcyBDaGFubmVsJywgdXJsPVVQREFURV9DSEFOTkVMKSkKICAgIGJvdC5y
+ZXBseV90byhtZXNzYWdlLCAiVmlzaXQgb3VyIFVwZGF0ZXMgQ2hhbm5lbDoi
+LCByZXBseV9tYXJrdXA9bWFya3VwKQoKZGVmIF9sb2dpY191cGxvYWRfZmls
+ZShtZXNzYWdlKToKICAgIHVzZXJfaWQgPSBtZXNzYWdlLmZyb21fdXNlci5p
+ZAogICAgaWYgYm90X2xvY2tlZCBhbmQgdXNlcl9pZCBub3QgaW4gYWRtaW5f
+aWRzOgogICAgICAgIGJvdC5yZXBseV90byhtZXNzYWdlLCAi4pqg77iPIEJv
+dCBsb2NrZWQgYnkgYWRtaW4sIGNhbm5vdCBhY2NlcHQgZmlsZXMuIikKICAg
+ICAgICByZXR1cm4KCiAgICAjIFJlbW92ZWQgZnJlZV9tb2RlIGNoZWNrLCBy
+ZWxpZXMgb24gZ2V0X3VzZXJfZmlsZV9saW1pdCBhbmQgRlJFRV9VU0VSX0xJ
+TUlUCiAgICAjIFVzZXJzIG5lZWQgdG8gYmUgYWRtaW4gb3Igc3Vic2NyaWJl
+ZCB0byB1cGxvYWQgaWYgRlJFRV9VU0VSX0xJTUlUIGlzIDAKICAgICMgRm9y
+IG5vdywgRlJFRV9VU0VSX0xJTUlUID4gMCwgc28gZnJlZSB1c2VycyBjYW4g
+dXBsb2FkIHVwIHRvIHRoYXQgbGltaXQuCiAgICAjIElmIHdlIHdhbnQgdG8g
+cmVzdHJpY3QgZnJlZSB1c2VycyBlbnRpcmVseSwgc2V0IEZSRUVfVVNFUl9M
+SU1JVCB0byAwLgogICAgIyBGb3IgdGhpcyBpbXBsZW1lbnRhdGlvbiwgZnJl
+ZSB1c2VycyBnZXQgRlJFRV9VU0VSX0xJTUlULgoKICAgIGZpbGVfbGltaXQg
+PSBnZXRfdXNlcl9maWxlX2xpbWl0KHVzZXJfaWQpCiAgICBjdXJyZW50X2Zp
+bGVzID0gZ2V0X3VzZXJfZmlsZV9jb3VudCh1c2VyX2lkKQogICAgaWYgY3Vy
+cmVudF9maWxlcyA+PSBmaWxlX2xpbWl0OgogICAgICAgIGxpbWl0X3N0ciA9
+IHN0cihmaWxlX2xpbWl0KSBpZiBmaWxlX2xpbWl0ICE9IGZsb2F0KCdpbmYn
+KSBlbHNlICJVbmxpbWl0ZWQiCiAgICAgICAgYm90LnJlcGx5X3RvKG1lc3Nh
+Z2UsIGYi4pqg77iPIEZpbGUgbGltaXQgKHtjdXJyZW50X2ZpbGVzfS97bGlt
+aXRfc3RyfSkgcmVhY2hlZC4gRGVsZXRlIGZpbGVzIGZpcnN0LiIpCiAgICAg
+ICAgcmV0dXJuCiAgICBib3QucmVwbHlfdG8obWVzc2FnZSwgIvCfk6QgU2Vu
+ZCB5b3VyIFB5dGhvbiAoYC5weWApLCBKUyAoYC5qc2ApLCBvciBaSVAgKGAu
+emlwYCkgZmlsZS4iKQoKZGVmIF9sb2dpY19jaGVja19maWxlcyhtZXNzYWdl
+KToKICAgIHVzZXJfaWQgPSBtZXNzYWdlLmZyb21fdXNlci5pZAogICAgIyBj
+aGF0X2lkID0gbWVzc2FnZS5jaGF0LmlkICMgdXNlcl9pZCB3aWxsIGJlIHVz
+ZWQgYXMgc2NyaXB0X293bmVyX2lkIGZvciBidXR0b25zCiAgICB1c2VyX2Zp
+bGVzX2xpc3QgPSB1c2VyX2ZpbGVzLmdldCh1c2VyX2lkLCBbXSkKICAgIGlm
+IG5vdCB1c2VyX2ZpbGVzX2xpc3Q6CiAgICAgICAgYm90LnJlcGx5X3RvKG1l
+c3NhZ2UsICLwn5OCIFlvdXIgZmlsZXM6XG5cbihObyBmaWxlcyB1cGxvYWRl
+ZCB5ZXQpIikKICAgICAgICByZXR1cm4KICAgIG1hcmt1cCA9IHR5cGVzLklu
+bGluZUtleWJvYXJkTWFya3VwKHJvd193aWR0aD0xKQogICAgZm9yIGZpbGVf
+bmFtZSwgZmlsZV90eXBlIGluIHNvcnRlZCh1c2VyX2ZpbGVzX2xpc3QpOgog
+ICAgICAgIGlzX3J1bm5pbmcgPSBpc19ib3RfcnVubmluZyh1c2VyX2lkLCBm
+aWxlX25hbWUpICMgVXNlIHVzZXJfaWQgZm9yIGNoZWNraW5nIHN0YXR1cwog
+ICAgICAgIHN0YXR1c19pY29uID0gIvCfn6IgUnVubmluZyIgaWYgaXNfcnVu
+bmluZyBlbHNlICLwn5S0IFN0b3BwZWQiCiAgICAgICAgYnRuX3RleHQgPSBm
+IntmaWxlX25hbWV9ICh7ZmlsZV90eXBlfSkgLSB7c3RhdHVzX2ljb259Igog
+ICAgICAgICMgQ2FsbGJhY2sgZGF0YSBpbmNsdWRlcyB1c2VyX2lkIGFzIHNj
+cmlwdF9vd25lcl9pZAogICAgICAgIG1hcmt1cC5hZGQodHlwZXMuSW5saW5l
+S2V5Ym9hcmRCdXR0b24oYnRuX3RleHQsIGNhbGxiYWNrX2RhdGE9ZidmaWxl
+X3t1c2VyX2lkfV97ZmlsZV9uYW1lfScpKQogICAgYm90LnJlcGx5X3RvKG1l
+c3NhZ2UsICLwn5OCIFlvdXIgZmlsZXM6XG5DbGljayB0byBtYW5hZ2UuIiwg
+cmVwbHlfbWFya3VwPW1hcmt1cCwgcGFyc2VfbW9kZT0nTWFya2Rvd24nKQoK
+ZGVmIF9sb2dpY19ib3Rfc3BlZWQobWVzc2FnZSk6CiAgICB1c2VyX2lkID0g
+bWVzc2FnZS5mcm9tX3VzZXIuaWQKICAgIGNoYXRfaWQgPSBtZXNzYWdlLmNo
+YXQuaWQKICAgIHN0YXJ0X3RpbWVfcGluZyA9IHRpbWUudGltZSgpCiAgICB3
+YWl0X21zZyA9IGJvdC5yZXBseV90byhtZXNzYWdlLCAi8J+PgyBUZXN0aW5n
+IHNwZWVkLi4uIikKICAgIHRyeToKICAgICAgICBib3Quc2VuZF9jaGF0X2Fj
+dGlvbihjaGF0X2lkLCAndHlwaW5nJykKICAgICAgICByZXNwb25zZV90aW1l
+ID0gcm91bmQoKHRpbWUudGltZSgpIC0gc3RhcnRfdGltZV9waW5nKSAqIDEw
+MDAsIDIpCiAgICAgICAgc3RhdHVzID0gIvCflJMgVW5sb2NrZWQiIGlmIG5v
+dCBib3RfbG9ja2VkIGVsc2UgIvCflJIgTG9ja2VkIgogICAgICAgICMgbW9k
+ZSA9ICLwn5KwIEZyZWUgTW9kZTogT04iIGlmIGZyZWVfbW9kZSBlbHNlICLw
+n5K4IEZyZWUgTW9kZTogT0ZGIiAjIFJlbW92ZWQgZnJlZV9tb2RlCiAgICAg
+ICAgaWYgdXNlcl9pZCA9PSBPV05FUl9JRDogdXNlcl9sZXZlbCA9ICLwn5GR
+IE93bmVyIgogICAgICAgIGVsaWYgdXNlcl9pZCBpbiBhZG1pbl9pZHM6IHVz
+ZXJfbGV2ZWwgPSAi8J+boe+4jyBBZG1pbiIKICAgICAgICBlbGlmIHVzZXJf
+aWQgaW4gdXNlcl9zdWJzY3JpcHRpb25zIGFuZCB1c2VyX3N1YnNjcmlwdGlv
+bnNbdXNlcl9pZF0uZ2V0KCdleHBpcnknLCBkYXRldGltZS5taW4pID4gZGF0
+ZXRpbWUubm93KCk6IHVzZXJfbGV2ZWwgPSAi4q2QIFByZW1pdW0iCiAgICAg
+ICAgZWxzZTogdXNlcl9sZXZlbCA9ICLwn4aTIEZyZWUgVXNlciIKICAgICAg
+ICBzcGVlZF9tc2cgPSAoZiLimqEgQm90IFNwZWVkICYgU3RhdHVzOlxuXG7i
+j7HvuI8gQVBJIFJlc3BvbnNlIFRpbWU6IHtyZXNwb25zZV90aW1lfSBtc1xu
+IgogICAgICAgICAgICAgICAgICAgICBmIvCfmqYgQm90IFN0YXR1czoge3N0
+YXR1c31cbiIKICAgICAgICAgICAgICAgICAgICAgIyBmIuaooeW8jyBNb2Rl
+OiB7bW9kZX1cbiIgIyBSZW1vdmVkCiAgICAgICAgICAgICAgICAgICAgIGYi
+8J+RpCBZb3VyIExldmVsOiB7dXNlcl9sZXZlbH0iKQogICAgICAgIGJvdC5l
+ZGl0X21lc3NhZ2VfdGV4dChzcGVlZF9tc2csIGNoYXRfaWQsIHdhaXRfbXNn
+Lm1lc3NhZ2VfaWQpCiAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6CiAgICAg
+ICAgbG9nZ2VyLmVycm9yKGYiRXJyb3IgZHVyaW5nIHNwZWVkIHRlc3QgKGNt
+ZCk6IHtlfSIsIGV4Y19pbmZvPVRydWUpCiAgICAgICAgYm90LmVkaXRfbWVz
+c2FnZV90ZXh0KCLinYwgRXJyb3IgZHVyaW5nIHNwZWVkIHRlc3QuIiwgY2hh
+dF9pZCwgd2FpdF9tc2cubWVzc2FnZV9pZCkKCmRlZiBfbG9naWNfY29udGFj
+dF9vd25lcihtZXNzYWdlKToKICAgIG1hcmt1cCA9IHR5cGVzLklubGluZUtl
+eWJvYXJkTWFya3VwKCkKICAgIG1hcmt1cC5hZGQodHlwZXMuSW5saW5lS2V5
+Ym9hcmRCdXR0b24oJ/Cfk54gQ29udGFjdCBPd25lcicsIHVybD1mJ2h0dHBz
+Oi8vdC5tZS97WU9VUl9VU0VSTkFNRS5yZXBsYWNlKCJAIiwgIiIpfScpKQog
+ICAgYm90LnJlcGx5X3RvKG1lc3NhZ2UsICJDbGljayB0byBjb250YWN0IE93
+bmVyOiIsIHJlcGx5X21hcmt1cD1tYXJrdXApCgojIC0tLSBBZG1pbiBMb2dp
+YyBGdW5jdGlvbnMgLS0tCmRlZiBfbG9naWNfc3Vic2NyaXB0aW9uc19wYW5l
+bChtZXNzYWdlKToKICAgIGlmIG1lc3NhZ2UuZnJvbV91c2VyLmlkIG5vdCBp
+biBhZG1pbl9pZHM6CiAgICAgICAgYm90LnJlcGx5X3RvKG1lc3NhZ2UsICLi
+mqDvuI8gQWRtaW4gcGVybWlzc2lvbnMgcmVxdWlyZWQuIikKICAgICAgICBy
+ZXR1cm4KICAgIGJvdC5yZXBseV90byhtZXNzYWdlLCAi8J+SsyBTdWJzY3Jp
+cHRpb24gTWFuYWdlbWVudFxuVXNlIGlubGluZSBidXR0b25zIGZyb20gL3N0
+YXJ0IG9yIGFkbWluIGNvbW1hbmQgbWVudS4iLCByZXBseV9tYXJrdXA9Y3Jl
+YXRlX3N1YnNjcmlwdGlvbl9tZW51KCkpCgpkZWYgX2xvZ2ljX3N0YXRpc3Rp
+Y3MobWVzc2FnZSk6CiAgICAjIE5vIGFkbWluIGNoZWNrIGhlcmUsIGFsbG93
+IGFsbCB1c2VycyBidXQgc2hvdyBhZG1pbi1zcGVjaWZpYyBpbmZvIGlmIGFk
+bWluCiAgICB1c2VyX2lkID0gbWVzc2FnZS5mcm9tX3VzZXIuaWQKICAgIHRv
+dGFsX3VzZXJzID0gbGVuKGFjdGl2ZV91c2VycykKICAgIHRvdGFsX2ZpbGVz
+X3JlY29yZHMgPSBzdW0obGVuKGZpbGVzKSBmb3IgZmlsZXMgaW4gdXNlcl9m
+aWxlcy52YWx1ZXMoKSkKCiAgICBydW5uaW5nX2JvdHNfY291bnQgPSAwCiAg
+ICB1c2VyX3J1bm5pbmdfYm90cyA9IDAKCiAgICBmb3Igc2NyaXB0X2tleV9p
+dGVyLCBzY3JpcHRfaW5mb19pdGVyIGluIGxpc3QoYm90X3NjcmlwdHMuaXRl
+bXMoKSk6CiAgICAgICAgc19vd25lcl9pZCwgXyA9IHNjcmlwdF9rZXlfaXRl
+ci5zcGxpdCgnXycsIDEpICMgRXh0cmFjdCBvd25lcl9pZCBmcm9tIGtleQog
+ICAgICAgIGlmIGlzX2JvdF9ydW5uaW5nKGludChzX293bmVyX2lkKSwgc2Ny
+aXB0X2luZm9faXRlclsnZmlsZV9uYW1lJ10pOgogICAgICAgICAgICBydW5u
+aW5nX2JvdHNfY291bnQgKz0gMQogICAgICAgICAgICBpZiBpbnQoc19vd25l
+cl9pZCkgPT0gdXNlcl9pZDoKICAgICAgICAgICAgICAgIHVzZXJfcnVubmlu
+Z19ib3RzICs9MQoKICAgIHN0YXRzX21zZ19iYXNlID0gKGYi8J+TiiBCb3Qg
+U3RhdGlzdGljczpcblxuIgogICAgICAgICAgICAgICAgICAgICAgZiLwn5Gl
+IFRvdGFsIFVzZXJzOiB7dG90YWxfdXNlcnN9XG4iCiAgICAgICAgICAgICAg
+ICAgICAgICBmIvCfk4IgVG90YWwgRmlsZSBSZWNvcmRzOiB7dG90YWxfZmls
+ZXNfcmVjb3Jkc31cbiIKICAgICAgICAgICAgICAgICAgICAgIGYi8J+foiBU
+b3RhbCBBY3RpdmUgQm90czoge3J1bm5pbmdfYm90c19jb3VudH1cbiIpCgog
+ICAgaWYgdXNlcl9pZCBpbiBhZG1pbl9pZHM6CiAgICAgICAgc3RhdHNfbXNn
+X2FkbWluID0gKGYi8J+UkiBCb3QgU3RhdHVzOiB7J/CflLQgTG9ja2VkJyBp
+ZiBib3RfbG9ja2VkIGVsc2UgJ/Cfn6IgVW5sb2NrZWQnfVxuIgogICAgICAg
+ICAgICAgICAgICAgICAgICAgICAjIGYi8J+SsCBGcmVlIE1vZGU6IHsn4pyF
+IE9OJyBpZiBmcmVlX21vZGUgZWxzZSAn4p2MIE9GRid9XG4iICMgUmVtb3Zl
+ZAogICAgICAgICAgICAgICAgICAgICAgICAgICBmIvCfpJYgWW91ciBSdW5u
+aW5nIEJvdHM6IHt1c2VyX3J1bm5pbmdfYm90c30iKQogICAgICAgIHN0YXRz
+X21zZyA9IHN0YXRzX21zZ19iYXNlICsgc3RhdHNfbXNnX2FkbWluCiAgICBl
+bHNlOgogICAgICAgIHN0YXRzX21zZyA9IHN0YXRzX21zZ19iYXNlICsgZiLw
+n6SWIFlvdXIgUnVubmluZyBCb3RzOiB7dXNlcl9ydW5uaW5nX2JvdHN9IgoK
+ICAgIGJvdC5yZXBseV90byhtZXNzYWdlLCBzdGF0c19tc2cpCgoKZGVmIF9s
+b2dpY19icm9hZGNhc3RfaW5pdChtZXNzYWdlKToKICAgIGlmIG1lc3NhZ2Uu
+ZnJvbV91c2VyLmlkIG5vdCBpbiBhZG1pbl9pZHM6CiAgICAgICAgYm90LnJl
+cGx5X3RvKG1lc3NhZ2UsICLimqDvuI8gQWRtaW4gcGVybWlzc2lvbnMgcmVx
+dWlyZWQuIikKICAgICAgICByZXR1cm4KICAgIG1zZyA9IGJvdC5yZXBseV90
+byhtZXNzYWdlLCAi8J+ToiBTZW5kIG1lc3NhZ2UgdG8gYnJvYWRjYXN0IHRv
+IGFsbCBhY3RpdmUgdXNlcnMuXG4vY2FuY2VsIHRvIGFib3J0LiIpCiAgICBi
+b3QucmVnaXN0ZXJfbmV4dF9zdGVwX2hhbmRsZXIobXNnLCBwcm9jZXNzX2Jy
+b2FkY2FzdF9tZXNzYWdlKQoKZGVmIF9sb2dpY190b2dnbGVfbG9ja19ib3Qo
+bWVzc2FnZSk6CiAgICBpZiBtZXNzYWdlLmZyb21fdXNlci5pZCBub3QgaW4g
+YWRtaW5faWRzOgogICAgICAgIGJvdC5yZXBseV90byhtZXNzYWdlLCAi4pqg
+77iPIEFkbWluIHBlcm1pc3Npb25zIHJlcXVpcmVkLiIpCiAgICAgICAgcmV0
+dXJuCiAgICBnbG9iYWwgYm90X2xvY2tlZAogICAgYm90X2xvY2tlZCA9IG5v
+dCBib3RfbG9ja2VkCiAgICBzdGF0dXMgPSAibG9ja2VkIiBpZiBib3RfbG9j
+a2VkIGVsc2UgInVubG9ja2VkIgogICAgbG9nZ2VyLndhcm5pbmcoZiJCb3Qg
+e3N0YXR1c30gYnkgQWRtaW4ge21lc3NhZ2UuZnJvbV91c2VyLmlkfSB2aWEg
+Y29tbWFuZC9idXR0b24uIikKICAgIGJvdC5yZXBseV90byhtZXNzYWdlLCBm
+IvCflJIgQm90IGhhcyBiZWVuIHtzdGF0dXN9LiIpCgojIGRlZiBfbG9naWNf
+dG9nZ2xlX2ZyZWVfbW9kZShtZXNzYWdlKTogIyBSZW1vdmVkCiMgICAgIHBh
+c3MKCmRlZiBfbG9naWNfYWRtaW5fcGFuZWwobWVzc2FnZSk6CiAgICBpZiBt
+ZXNzYWdlLmZyb21fdXNlci5pZCBub3QgaW4gYWRtaW5faWRzOgogICAgICAg
+IGJvdC5yZXBseV90byhtZXNzYWdlLCAi4pqg77iPIEFkbWluIHBlcm1pc3Np
+b25zIHJlcXVpcmVkLiIpCiAgICAgICAgcmV0dXJuCiAgICBib3QucmVwbHlf
+dG8obWVzc2FnZSwgIvCfkZEgQWRtaW4gUGFuZWxcbk1hbmFnZSBhZG1pbnMu
+IFVzZSBpbmxpbmUgYnV0dG9ucyBmcm9tIC9zdGFydCBvciBhZG1pbiBtZW51
+LiIsCiAgICAgICAgICAgICAgICAgcmVwbHlfbWFya3VwPWNyZWF0ZV9hZG1p
+bl9wYW5lbCgpKQoKZGVmIF9sb2dpY19ydW5fYWxsX3NjcmlwdHMobWVzc2Fn
+ZV9vcl9jYWxsKToKICAgIGlmIGlzaW5zdGFuY2UobWVzc2FnZV9vcl9jYWxs
+LCB0ZWxlYm90LnR5cGVzLk1lc3NhZ2UpOgogICAgICAgIGFkbWluX3VzZXJf
+aWQgPSBtZXNzYWdlX29yX2NhbGwuZnJvbV91c2VyLmlkCiAgICAgICAgYWRt
+aW5fY2hhdF9pZCA9IG1lc3NhZ2Vfb3JfY2FsbC5jaGF0LmlkCiAgICAgICAg
+cmVwbHlfZnVuYyA9IGxhbWJkYSB0ZXh0LCAqKmt3YXJnczogYm90LnJlcGx5
+X3RvKG1lc3NhZ2Vfb3JfY2FsbCwgdGV4dCwgKiprd2FyZ3MpCiAgICAgICAg
+YWRtaW5fbWVzc2FnZV9vYmpfZm9yX3NjcmlwdF9ydW5uZXIgPSBtZXNzYWdl
+X29yX2NhbGwKICAgIGVsaWYgaXNpbnN0YW5jZShtZXNzYWdlX29yX2NhbGws
+IHRlbGVib3QudHlwZXMuQ2FsbGJhY2tRdWVyeSk6CiAgICAgICAgYWRtaW5f
+dXNlcl9pZCA9IG1lc3NhZ2Vfb3JfY2FsbC5mcm9tX3VzZXIuaWQKICAgICAg
+ICBhZG1pbl9jaGF0X2lkID0gbWVzc2FnZV9vcl9jYWxsLm1lc3NhZ2UuY2hh
+dC5pZAogICAgICAgIGJvdC5hbnN3ZXJfY2FsbGJhY2tfcXVlcnkobWVzc2Fn
+ZV9vcl9jYWxsLmlkKQogICAgICAgIHJlcGx5X2Z1bmMgPSBsYW1iZGEgdGV4
+dCwgKiprd2FyZ3M6IGJvdC5zZW5kX21lc3NhZ2UoYWRtaW5fY2hhdF9pZCwg
+dGV4dCwgKiprd2FyZ3MpCiAgICAgICAgYWRtaW5fbWVzc2FnZV9vYmpfZm9y
+X3NjcmlwdF9ydW5uZXIgPSBtZXNzYWdlX29yX2NhbGwubWVzc2FnZSAKICAg
+IGVsc2U6CiAgICAgICAgbG9nZ2VyLmVycm9yKCJJbnZhbGlkIGFyZ3VtZW50
+IGZvciBfbG9naWNfcnVuX2FsbF9zY3JpcHRzIikKICAgICAgICByZXR1cm4K
+CiAgICBpZiBhZG1pbl91c2VyX2lkIG5vdCBpbiBhZG1pbl9pZHM6CiAgICAg
+ICAgcmVwbHlfZnVuYygi4pqg77iPIEFkbWluIHBlcm1pc3Npb25zIHJlcXVp
+cmVkLiIpCiAgICAgICAgcmV0dXJuCgogICAgcmVwbHlfZnVuYygi4o+zIFN0
+YXJ0aW5nIHByb2Nlc3MgdG8gcnVuIGFsbCB1c2VyIHNjcmlwdHMuIFRoaXMg
+bWF5IHRha2UgYSB3aGlsZS4uLiIpCiAgICBsb2dnZXIuaW5mbyhmIkFkbWlu
+IHthZG1pbl91c2VyX2lkfSBpbml0aWF0ZWQgJ3J1biBhbGwgc2NyaXB0cycg
+ZnJvbSBjaGF0IHthZG1pbl9jaGF0X2lkfS4iKQoKICAgIHN0YXJ0ZWRfY291
+bnQgPSAwOyBhdHRlbXB0ZWRfdXNlcnMgPSAwOyBza2lwcGVkX2ZpbGVzID0g
+MDsgZXJyb3JfZmlsZXNfZGV0YWlscyA9IFtdCgogICAgIyBVc2UgYSBjb3B5
+IG9mIHVzZXJfZmlsZXMga2V5cyBhbmQgdmFsdWVzIHRvIGF2b2lkIG1vZGlm
+aWNhdGlvbiBpc3N1ZXMgZHVyaW5nIGl0ZXJhdGlvbgogICAgYWxsX3VzZXJf
+ZmlsZXNfc25hcHNob3QgPSBkaWN0KHVzZXJfZmlsZXMpCgogICAgZm9yIHRh
+cmdldF91c2VyX2lkLCBmaWxlc19mb3JfdXNlciBpbiBhbGxfdXNlcl9maWxl
+c19zbmFwc2hvdC5pdGVtcygpOgogICAgICAgIGlmIG5vdCBmaWxlc19mb3Jf
+dXNlcjogY29udGludWUKICAgICAgICBhdHRlbXB0ZWRfdXNlcnMgKz0gMQog
+ICAgICAgIGxvZ2dlci5pbmZvKGYiUHJvY2Vzc2luZyBzY3JpcHRzIGZvciB1
+c2VyIHt0YXJnZXRfdXNlcl9pZH0uLi4iKQogICAgICAgIHVzZXJfZm9sZGVy
+ID0gZ2V0X3VzZXJfZm9sZGVyKHRhcmdldF91c2VyX2lkKQoKICAgICAgICBm
+b3IgZmlsZV9uYW1lLCBmaWxlX3R5cGUgaW4gZmlsZXNfZm9yX3VzZXI6CiAg
+ICAgICAgICAgICMgc2NyaXB0X293bmVyX2lkIGZvciBrZXkgY29udGV4dCBp
+cyB0YXJnZXRfdXNlcl9pZAogICAgICAgICAgICBpZiBub3QgaXNfYm90X3J1
+bm5pbmcodGFyZ2V0X3VzZXJfaWQsIGZpbGVfbmFtZSk6CiAgICAgICAgICAg
+ICAgICBmaWxlX3BhdGggPSBvcy5wYXRoLmpvaW4odXNlcl9mb2xkZXIsIGZp
+bGVfbmFtZSkKICAgICAgICAgICAgICAgIGlmIG9zLnBhdGguZXhpc3RzKGZp
+bGVfcGF0aCk6CiAgICAgICAgICAgICAgICAgICAgbG9nZ2VyLmluZm8oZiJB
+ZG1pbiB7YWRtaW5fdXNlcl9pZH0gYXR0ZW1wdGluZyB0byBzdGFydCAne2Zp
+bGVfbmFtZX0nICh7ZmlsZV90eXBlfSkgZm9yIHVzZXIge3RhcmdldF91c2Vy
+X2lkfS4iKQogICAgICAgICAgICAgICAgICAgIHRyeToKICAgICAgICAgICAg
+ICAgICAgICAgICAgaWYgZmlsZV90eXBlID09ICdweSc6CiAgICAgICAgICAg
+ICAgICAgICAgICAgICAgICB0aHJlYWRpbmcuVGhyZWFkKHRhcmdldD1ydW5f
+c2NyaXB0LCBhcmdzPShmaWxlX3BhdGgsIHRhcmdldF91c2VyX2lkLCB1c2Vy
+X2ZvbGRlciwgZmlsZV9uYW1lLCBhZG1pbl9tZXNzYWdlX29ial9mb3Jfc2Ny
+aXB0X3J1bm5lcikpLnN0YXJ0KCkKICAgICAgICAgICAgICAgICAgICAgICAg
+ICAgIHN0YXJ0ZWRfY291bnQgKz0gMQogICAgICAgICAgICAgICAgICAgICAg
+ICBlbGlmIGZpbGVfdHlwZSA9PSAnanMnOgogICAgICAgICAgICAgICAgICAg
+ICAgICAgICAgdGhyZWFkaW5nLlRocmVhZCh0YXJnZXQ9cnVuX2pzX3Njcmlw
+dCwgYXJncz0oZmlsZV9wYXRoLCB0YXJnZXRfdXNlcl9pZCwgdXNlcl9mb2xk
+ZXIsIGZpbGVfbmFtZSwgYWRtaW5fbWVzc2FnZV9vYmpfZm9yX3NjcmlwdF9y
+dW5uZXIpKS5zdGFydCgpCiAgICAgICAgICAgICAgICAgICAgICAgICAgICBz
+dGFydGVkX2NvdW50ICs9IDEKICAgICAgICAgICAgICAgICAgICAgICAgZWxz
+ZToKICAgICAgICAgICAgICAgICAgICAgICAgICAgIGxvZ2dlci53YXJuaW5n
+KGYiVW5rbm93biBmaWxlIHR5cGUgJ3tmaWxlX3R5cGV9JyBmb3Ige2ZpbGVf
+bmFtZX0gKHVzZXIge3RhcmdldF91c2VyX2lkfSkuIFNraXBwaW5nLiIpCiAg
+ICAgICAgICAgICAgICAgICAgICAgICAgICBlcnJvcl9maWxlc19kZXRhaWxz
+LmFwcGVuZChmImB7ZmlsZV9uYW1lfWAgKFVzZXIge3RhcmdldF91c2VyX2lk
+fSkgLSBVbmtub3duIHR5cGUiKQogICAgICAgICAgICAgICAgICAgICAgICAg
+ICAgc2tpcHBlZF9maWxlcyArPSAxCiAgICAgICAgICAgICAgICAgICAgICAg
+IHRpbWUuc2xlZXAoMC43KSAjIEluY3JlYXNlZCBkZWxheSBzbGlnaHRseQog
+ICAgICAgICAgICAgICAgICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAg
+ICAgICAgICAgICAgICAgICAgICAgbG9nZ2VyLmVycm9yKGYiRXJyb3IgcXVl
+dWVpbmcgc3RhcnQgZm9yICd7ZmlsZV9uYW1lfScgKHVzZXIge3RhcmdldF91
+c2VyX2lkfSk6IHtlfSIpCiAgICAgICAgICAgICAgICAgICAgICAgIGVycm9y
+X2ZpbGVzX2RldGFpbHMuYXBwZW5kKGYiYHtmaWxlX25hbWV9YCAoVXNlciB7
+dGFyZ2V0X3VzZXJfaWR9KSAtIFN0YXJ0IGVycm9yIikKICAgICAgICAgICAg
+ICAgICAgICAgICAgc2tpcHBlZF9maWxlcyArPSAxCiAgICAgICAgICAgICAg
+ICBlbHNlOgogICAgICAgICAgICAgICAgICAgIGxvZ2dlci53YXJuaW5nKGYi
+RmlsZSAne2ZpbGVfbmFtZX0nIGZvciB1c2VyIHt0YXJnZXRfdXNlcl9pZH0g
+bm90IGZvdW5kIGF0ICd7ZmlsZV9wYXRofScuIFNraXBwaW5nLiIpCiAgICAg
+ICAgICAgICAgICAgICAgZXJyb3JfZmlsZXNfZGV0YWlscy5hcHBlbmQoZiJg
+e2ZpbGVfbmFtZX1gIChVc2VyIHt0YXJnZXRfdXNlcl9pZH0pIC0gRmlsZSBu
+b3QgZm91bmQiKQogICAgICAgICAgICAgICAgICAgIHNraXBwZWRfZmlsZXMg
+Kz0gMQogICAgICAgICAgICAjIGVsc2U6IGxvZ2dlci5pbmZvKGYiU2NyaXB0
+ICd7ZmlsZV9uYW1lfScgZm9yIHVzZXIge3RhcmdldF91c2VyX2lkfSBhbHJl
+YWR5IHJ1bm5pbmcuIikKCiAgICBzdW1tYXJ5X21zZyA9IChmIuKchSBBbGwg
+VXNlcnMnIFNjcmlwdHMgLSBQcm9jZXNzaW5nIENvbXBsZXRlOlxuXG4iCiAg
+ICAgICAgICAgICAgICAgICBmIuKWtu+4jyBBdHRlbXB0ZWQgdG8gc3RhcnQ6
+IHtzdGFydGVkX2NvdW50fSBzY3JpcHRzLlxuIgogICAgICAgICAgICAgICAg
+ICAgZiLwn5GlIFVzZXJzIHByb2Nlc3NlZDoge2F0dGVtcHRlZF91c2Vyc30u
+XG4iKQogICAgaWYgc2tpcHBlZF9maWxlcyA+IDA6CiAgICAgICAgc3VtbWFy
+eV9tc2cgKz0gZiLimqDvuI8gU2tpcHBlZC9FcnJvciBmaWxlczoge3NraXBw
+ZWRfZmlsZXN9XG4iCiAgICAgICAgaWYgZXJyb3JfZmlsZXNfZGV0YWlsczoK
+ICAgICAgICAgICAgIHN1bW1hcnlfbXNnICs9ICJEZXRhaWxzIChmaXJzdCA1
+KTpcbiIgKyAiXG4iLmpvaW4oW2YiICAtIHtlcnJ9IiBmb3IgZXJyIGluIGVy
+cm9yX2ZpbGVzX2RldGFpbHNbOjVdXSkKICAgICAgICAgICAgIGlmIGxlbihl
+cnJvcl9maWxlc19kZXRhaWxzKSA+IDU6IHN1bW1hcnlfbXNnICs9ICJcbiAg
+Li4uIGFuZCBtb3JlIChjaGVjayBsb2dzKS4iCgogICAgcmVwbHlfZnVuYyhz
+dW1tYXJ5X21zZywgcGFyc2VfbW9kZT0nTWFya2Rvd24nKQogICAgbG9nZ2Vy
+LmluZm8oZiJSdW4gYWxsIHNjcmlwdHMgZmluaXNoZWQuIEFkbWluOiB7YWRt
+aW5fdXNlcl9pZH0uIFN0YXJ0ZWQ6IHtzdGFydGVkX2NvdW50fS4gU2tpcHBl
+ZC9FcnJvcnM6IHtza2lwcGVkX2ZpbGVzfSIpCgoKIyAtLS0gQ29tbWFuZCBI
+YW5kbGVycyAmIFRleHQgSGFuZGxlcnMgZm9yIFJlcGx5S2V5Ym9hcmQgLS0t
+CkBib3QubWVzc2FnZV9oYW5kbGVyKGNvbW1hbmRzPVsnc3RhcnQnLCAnaGVs
+cCddKQpkZWYgY29tbWFuZF9zZW5kX3dlbGNvbWUobWVzc2FnZSk6IF9sb2dp
+Y19zZW5kX3dlbGNvbWUobWVzc2FnZSkKCkBib3QubWVzc2FnZV9oYW5kbGVy
+KGNvbW1hbmRzPVsnc3RhdHVzJ10pICMgS2VwdCBmb3IgZGlyZWN0IGNvbW1h
+bmQKZGVmIGNvbW1hbmRfc2hvd19zdGF0dXMobWVzc2FnZSk6IF9sb2dpY19z
+dGF0aXN0aWNzKG1lc3NhZ2UpICMgQ2hhbmdlZCB0byBjYWxsIF9sb2dpY19z
+dGF0aXN0aWNzCgoKQlVUVE9OX1RFWFRfVE9fTE9HSUMgPSB7CiAgICAi8J+T
+oiBVcGRhdGVzIENoYW5uZWwiOiBfbG9naWNfdXBkYXRlc19jaGFubmVsLAog
+ICAgIvCfk6QgVXBsb2FkIEZpbGUiOiBfbG9naWNfdXBsb2FkX2ZpbGUsCiAg
+ICAi8J+TgiBDaGVjayBGaWxlcyI6IF9sb2dpY19jaGVja19maWxlcywKICAg
+ICLimqEgQm90IFNwZWVkIjogX2xvZ2ljX2JvdF9zcGVlZCwKICAgICLwn5Oe
+IENvbnRhY3QgT3duZXIiOiBfbG9naWNfY29udGFjdF9vd25lciwKICAgICLw
+n5OKIFN0YXRpc3RpY3MiOiBfbG9naWNfc3RhdGlzdGljcywgCiAgICAi8J+S
+syBTdWJzY3JpcHRpb25zIjogX2xvZ2ljX3N1YnNjcmlwdGlvbnNfcGFuZWws
+CiAgICAi8J+ToiBCcm9hZGNhc3QiOiBfbG9naWNfYnJvYWRjYXN0X2luaXQs
+CiAgICAi8J+UkiBMb2NrIEJvdCI6IF9sb2dpY190b2dnbGVfbG9ja19ib3Qs
+IAogICAgIyAi8J+SsCBGcmVlIE1vZGUiOiBfbG9naWNfdG9nZ2xlX2ZyZWVf
+bW9kZSwgIyBSZW1vdmVkCiAgICAi8J+foiBSdW5uaW5nIEFsbCBDb2RlIjog
+X2xvZ2ljX3J1bl9hbGxfc2NyaXB0cywgIyBBZGRlZAogICAgIvCfkZEgQWRt
+aW4gUGFuZWwiOiBfbG9naWNfYWRtaW5fcGFuZWwsCn0KCkBib3QubWVzc2Fn
+ZV9oYW5kbGVyKGZ1bmM9bGFtYmRhIG1lc3NhZ2U6IG1lc3NhZ2UudGV4dCBp
+biBCVVRUT05fVEVYVF9UT19MT0dJQykKZGVmIGhhbmRsZV9idXR0b25fdGV4
+dChtZXNzYWdlKToKICAgIGxvZ2ljX2Z1bmMgPSBCVVRUT05fVEVYVF9UT19M
+T0dJQy5nZXQobWVzc2FnZS50ZXh0KQogICAgaWYgbG9naWNfZnVuYzogbG9n
+aWNfZnVuYyhtZXNzYWdlKQogICAgZWxzZTogbG9nZ2VyLndhcm5pbmcoZiJC
+dXR0b24gdGV4dCAne21lc3NhZ2UudGV4dH0nIG1hdGNoZWQgYnV0IG5vIGxv
+Z2ljIGZ1bmMuIikKCkBib3QubWVzc2FnZV9oYW5kbGVyKGNvbW1hbmRzPVsn
+dXBkYXRlc2NoYW5uZWwnXSkKZGVmIGNvbW1hbmRfdXBkYXRlc19jaGFubmVs
+KG1lc3NhZ2UpOiBfbG9naWNfdXBkYXRlc19jaGFubmVsKG1lc3NhZ2UpCkBi
+b3QubWVzc2FnZV9oYW5kbGVyKGNvbW1hbmRzPVsndXBsb2FkZmlsZSddKQpk
+ZWYgY29tbWFuZF91cGxvYWRfZmlsZShtZXNzYWdlKTogX2xvZ2ljX3VwbG9h
+ZF9maWxlKG1lc3NhZ2UpCkBib3QubWVzc2FnZV9oYW5kbGVyKGNvbW1hbmRz
+PVsnY2hlY2tmaWxlcyddKQpkZWYgY29tbWFuZF9jaGVja19maWxlcyhtZXNz
+YWdlKTogX2xvZ2ljX2NoZWNrX2ZpbGVzKG1lc3NhZ2UpCkBib3QubWVzc2Fn
+ZV9oYW5kbGVyKGNvbW1hbmRzPVsnYm90c3BlZWQnXSkKZGVmIGNvbW1hbmRf
+Ym90X3NwZWVkKG1lc3NhZ2UpOiBfbG9naWNfYm90X3NwZWVkKG1lc3NhZ2Up
+CkBib3QubWVzc2FnZV9oYW5kbGVyKGNvbW1hbmRzPVsnY29udGFjdG93bmVy
+J10pCmRlZiBjb21tYW5kX2NvbnRhY3Rfb3duZXIobWVzc2FnZSk6IF9sb2dp
+Y19jb250YWN0X293bmVyKG1lc3NhZ2UpCkBib3QubWVzc2FnZV9oYW5kbGVy
+KGNvbW1hbmRzPVsnc3Vic2NyaXB0aW9ucyddKQpkZWYgY29tbWFuZF9zdWJz
+Y3JpcHRpb25zKG1lc3NhZ2UpOiBfbG9naWNfc3Vic2NyaXB0aW9uc19wYW5l
+bChtZXNzYWdlKQpAYm90Lm1lc3NhZ2VfaGFuZGxlcihjb21tYW5kcz1bJ3N0
+YXRpc3RpY3MnXSkgIyBBbGlhcyBmb3IgL3N0YXR1cwpkZWYgY29tbWFuZF9z
+dGF0aXN0aWNzKG1lc3NhZ2UpOiBfbG9naWNfc3RhdGlzdGljcyhtZXNzYWdl
+KQpAYm90Lm1lc3NhZ2VfaGFuZGxlcihjb21tYW5kcz1bJ2Jyb2FkY2FzdCdd
+KQpkZWYgY29tbWFuZF9icm9hZGNhc3QobWVzc2FnZSk6IF9sb2dpY19icm9h
+ZGNhc3RfaW5pdChtZXNzYWdlKQpAYm90Lm1lc3NhZ2VfaGFuZGxlcihjb21t
+YW5kcz1bJ2xvY2tib3QnXSkgCmRlZiBjb21tYW5kX2xvY2tfYm90KG1lc3Nh
+Z2UpOiBfbG9naWNfdG9nZ2xlX2xvY2tfYm90KG1lc3NhZ2UpCiMgQGJvdC5t
+ZXNzYWdlX2hhbmRsZXIoY29tbWFuZHM9WydmcmVlbW9kZSddKSAjIFJlbW92
+ZWQKIyBkZWYgY29tbWFuZF9mcmVlX21vZGUobWVzc2FnZSk6IF9sb2dpY190
+b2dnbGVfZnJlZV9tb2RlKG1lc3NhZ2UpCkBib3QubWVzc2FnZV9oYW5kbGVy
+KGNvbW1hbmRzPVsnYWRtaW5wYW5lbCddKQpkZWYgY29tbWFuZF9hZG1pbl9w
+YW5lbChtZXNzYWdlKTogX2xvZ2ljX2FkbWluX3BhbmVsKG1lc3NhZ2UpCkBi
+b3QubWVzc2FnZV9oYW5kbGVyKGNvbW1hbmRzPVsncnVubmluZ2FsbGNvZGUn
+XSkgIyBBZGRlZApkZWYgY29tbWFuZF9ydW5fYWxsX2NvZGUobWVzc2FnZSk6
+IF9sb2dpY19ydW5fYWxsX3NjcmlwdHMobWVzc2FnZSkKCgpAYm90Lm1lc3Nh
+Z2VfaGFuZGxlcihjb21tYW5kcz1bJ3BpbmcnXSkKZGVmIHBpbmcobWVzc2Fn
+ZSk6CiAgICBzdGFydF9waW5nX3RpbWUgPSB0aW1lLnRpbWUoKSAKICAgIG1z
+ZyA9IGJvdC5yZXBseV90byhtZXNzYWdlLCAiUG9uZyEiKQogICAgbGF0ZW5j
+eSA9IHJvdW5kKCh0aW1lLnRpbWUoKSAtIHN0YXJ0X3BpbmdfdGltZSkgKiAx
+MDAwLCAyKQogICAgYm90LmVkaXRfbWVzc2FnZV90ZXh0KGYiUG9uZyEgTGF0
+ZW5jeToge2xhdGVuY3l9IG1zIiwgbWVzc2FnZS5jaGF0LmlkLCBtc2cubWVz
+c2FnZV9pZCkKCgojIC0tLSBEb2N1bWVudCAoRmlsZSkgSGFuZGxlciAtLS0K
+QGJvdC5tZXNzYWdlX2hhbmRsZXIoY29udGVudF90eXBlcz1bJ2RvY3VtZW50
+J10pCmRlZiBoYW5kbGVfZmlsZV91cGxvYWRfZG9jKG1lc3NhZ2UpOiAjIFJl
+bmFtZWQKICAgIHVzZXJfaWQgPSBtZXNzYWdlLmZyb21fdXNlci5pZAogICAg
+Y2hhdF9pZCA9IG1lc3NhZ2UuY2hhdC5pZCAjIFVzZWQgZm9yIHJlcGxpZXMs
+IHNjcmlwdCBjb250ZXh0IHVzZXMgdXNlcl9pZAogICAgZG9jID0gbWVzc2Fn
+ZS5kb2N1bWVudAogICAgbG9nZ2VyLmluZm8oZiJEb2MgZnJvbSB7dXNlcl9p
+ZH06IHtkb2MuZmlsZV9uYW1lfSAoe2RvYy5taW1lX3R5cGV9KSwgU2l6ZTog
+e2RvYy5maWxlX3NpemV9IikKCiAgICBpZiBib3RfbG9ja2VkIGFuZCB1c2Vy
+X2lkIG5vdCBpbiBhZG1pbl9pZHM6CiAgICAgICAgYm90LnJlcGx5X3RvKG1l
+c3NhZ2UsICLimqDvuI8gQm90IGxvY2tlZCwgY2Fubm90IGFjY2VwdCBmaWxl
+cy4iKQogICAgICAgIHJldHVybgoKICAgICMgRmlsZSBsaW1pdCBjaGVjayAo
+cmVsaWVzIG9uIEZSRUVfVVNFUl9MSU1JVCBiZWluZyA+IDAgZm9yIGZyZWUg
+dXNlcnMpCiAgICBmaWxlX2xpbWl0ID0gZ2V0X3VzZXJfZmlsZV9saW1pdCh1
+c2VyX2lkKQogICAgY3VycmVudF9maWxlcyA9IGdldF91c2VyX2ZpbGVfY291
+bnQodXNlcl9pZCkKICAgIGlmIGN1cnJlbnRfZmlsZXMgPj0gZmlsZV9saW1p
+dDoKICAgICAgICBsaW1pdF9zdHIgPSBzdHIoZmlsZV9saW1pdCkgaWYgZmls
+ZV9saW1pdCAhPSBmbG9hdCgnaW5mJykgZWxzZSAiVW5saW1pdGVkIgogICAg
+ICAgIGJvdC5yZXBseV90byhtZXNzYWdlLCBmIuKaoO+4jyBGaWxlIGxpbWl0
+ICh7Y3VycmVudF9maWxlc30ve2xpbWl0X3N0cn0pIHJlYWNoZWQuIERlbGV0
+ZSBmaWxlcyB2aWEgL2NoZWNrZmlsZXMuIikKICAgICAgICByZXR1cm4KCiAg
+ICBmaWxlX25hbWUgPSBkb2MuZmlsZV9uYW1lCiAgICBpZiBub3QgZmlsZV9u
+YW1lOiBib3QucmVwbHlfdG8obWVzc2FnZSwgIuKaoO+4jyBObyBmaWxlIG5h
+bWUuIEVuc3VyZSBmaWxlIGhhcyBhIG5hbWUuIik7IHJldHVybgogICAgZmls
+ZV9leHQgPSBvcy5wYXRoLnNwbGl0ZXh0KGZpbGVfbmFtZSlbMV0ubG93ZXIo
+KQogICAgaWYgZmlsZV9leHQgbm90IGluIFsnLnB5JywgJy5qcycsICcuemlw
+J106CiAgICAgICAgYm90LnJlcGx5X3RvKG1lc3NhZ2UsICLimqDvuI8gVW5z
+dXBwb3J0ZWQgdHlwZSEgT25seSBgLnB5YCwgYC5qc2AsIGAuemlwYCBhbGxv
+d2VkLiIpCiAgICAgICAgcmV0dXJuCiAgICBtYXhfZmlsZV9zaXplID0gMjAg
+KiAxMDI0ICogMTAyNCAjIDIwIE1CCiAgICBpZiBkb2MuZmlsZV9zaXplID4g
+bWF4X2ZpbGVfc2l6ZToKICAgICAgICBib3QucmVwbHlfdG8obWVzc2FnZSwg
+ZiLimqDvuI8gRmlsZSB0b28gbGFyZ2UgKE1heDoge21heF9maWxlX3NpemUg
+Ly8gMTAyNCAvLyAxMDI0fSBNQikuIik7IHJldHVybgoKICAgIHRyeToKICAg
+ICAgICB0cnk6CiAgICAgICAgICAgIGJvdC5mb3J3YXJkX21lc3NhZ2UoT1dO
+RVJfSUQsIGNoYXRfaWQsIG1lc3NhZ2UubWVzc2FnZV9pZCkKICAgICAgICAg
+ICAgYm90LnNlbmRfbWVzc2FnZShPV05FUl9JRCwgZiLirIbvuI8gRmlsZSAn
+e2ZpbGVfbmFtZX0nIGZyb20ge21lc3NhZ2UuZnJvbV91c2VyLmZpcnN0X25h
+bWV9IChge3VzZXJfaWR9YCkiLCBwYXJzZV9tb2RlPSdNYXJrZG93bicpCiAg
+ICAgICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOiBsb2dnZXIuZXJyb3IoZiJG
+YWlsZWQgdG8gZm9yd2FyZCB1cGxvYWRlZCBmaWxlIHRvIE9XTkVSX0lEIHtP
+V05FUl9JRH06IHtlfSIpCgogICAgICAgIGRvd25sb2FkX3dhaXRfbXNnID0g
+Ym90LnJlcGx5X3RvKG1lc3NhZ2UsIGYi4o+zIERvd25sb2FkaW5nIGB7Zmls
+ZV9uYW1lfWAuLi4iKQogICAgICAgIGZpbGVfaW5mb190Z19kb2MgPSBib3Qu
+Z2V0X2ZpbGUoZG9jLmZpbGVfaWQpICMgUmVuYW1lZAogICAgICAgIGRvd25s
+b2FkZWRfZmlsZV9jb250ZW50ID0gYm90LmRvd25sb2FkX2ZpbGUoZmlsZV9p
+bmZvX3RnX2RvYy5maWxlX3BhdGgpCiAgICAgICAgYm90LmVkaXRfbWVzc2Fn
+ZV90ZXh0KGYi4pyFIERvd25sb2FkZWQgYHtmaWxlX25hbWV9YC4gUHJvY2Vz
+c2luZy4uLiIsIGNoYXRfaWQsIGRvd25sb2FkX3dhaXRfbXNnLm1lc3NhZ2Vf
+aWQpCiAgICAgICAgbG9nZ2VyLmluZm8oZiJEb3dubG9hZGVkIHtmaWxlX25h
+bWV9IGZvciB1c2VyIHt1c2VyX2lkfSIpCiAgICAgICAgdXNlcl9mb2xkZXIg
+PSBnZXRfdXNlcl9mb2xkZXIodXNlcl9pZCkKCiAgICAgICAgaWYgZmlsZV9l
+eHQgPT0gJy56aXAnOgogICAgICAgICAgICBoYW5kbGVfemlwX2ZpbGUoZG93
+bmxvYWRlZF9maWxlX2NvbnRlbnQsIGZpbGVfbmFtZSwgbWVzc2FnZSkKICAg
+ICAgICBlbHNlOgogICAgICAgICAgICBmaWxlX3BhdGggPSBvcy5wYXRoLmpv
+aW4odXNlcl9mb2xkZXIsIGZpbGVfbmFtZSkKICAgICAgICAgICAgd2l0aCBv
+cGVuKGZpbGVfcGF0aCwgJ3diJykgYXMgZjogZi53cml0ZShkb3dubG9hZGVk
+X2ZpbGVfY29udGVudCkKICAgICAgICAgICAgbG9nZ2VyLmluZm8oZiJTYXZl
+ZCBzaW5nbGUgZmlsZSB0byB7ZmlsZV9wYXRofSIpCiAgICAgICAgICAgICMg
+UGFzcyB1c2VyX2lkIGFzIHNjcmlwdF9vd25lcl9pZAogICAgICAgICAgICBp
+ZiBmaWxlX2V4dCA9PSAnLmpzJzogaGFuZGxlX2pzX2ZpbGUoZmlsZV9wYXRo
+LCB1c2VyX2lkLCB1c2VyX2ZvbGRlciwgZmlsZV9uYW1lLCBtZXNzYWdlKQog
+ICAgICAgICAgICBlbGlmIGZpbGVfZXh0ID09ICcucHknOiBoYW5kbGVfcHlf
+ZmlsZShmaWxlX3BhdGgsIHVzZXJfaWQsIHVzZXJfZm9sZGVyLCBmaWxlX25h
+bWUsIG1lc3NhZ2UpCiAgICBleGNlcHQgdGVsZWJvdC5hcGloZWxwZXIuQXBp
+VGVsZWdyYW1FeGNlcHRpb24gYXMgZToKICAgICAgICAgbG9nZ2VyLmVycm9y
+KGYiVGVsZWdyYW0gQVBJIEVycm9yIGhhbmRsaW5nIGZpbGUgZm9yIHt1c2Vy
+X2lkfToge2V9IiwgZXhjX2luZm89VHJ1ZSkKICAgICAgICAgaWYgImZpbGUg
+aXMgdG9vIGJpZyIgaW4gc3RyKGUpLmxvd2VyKCk6CiAgICAgICAgICAgICAg
+Ym90LnJlcGx5X3RvKG1lc3NhZ2UsIGYi4p2MIFRlbGVncmFtIEFQSSBFcnJv
+cjogRmlsZSB0b28gbGFyZ2UgdG8gZG93bmxvYWQgKH4yME1CIGxpbWl0KS4i
+KQogICAgICAgICBlbHNlOiBib3QucmVwbHlfdG8obWVzc2FnZSwgZiLinYwg
+VGVsZWdyYW0gQVBJIEVycm9yOiB7c3RyKGUpfS4gVHJ5IGxhdGVyLiIpCiAg
+ICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6CiAgICAgICAgbG9nZ2VyLmVycm9y
+KGYi4p2MIEdlbmVyYWwgZXJyb3IgaGFuZGxpbmcgZmlsZSBmb3Ige3VzZXJf
+aWR9OiB7ZX0iLCBleGNfaW5mbz1UcnVlKQogICAgICAgIGJvdC5yZXBseV90
+byhtZXNzYWdlLCBmIuKdjCBVbmV4cGVjdGVkIGVycm9yOiB7c3RyKGUpfSIp
+CiMgLS0tIEVuZCBEb2N1bWVudCBIYW5kbGVyIC0tLQoKCiMgLS0tIENhbGxi
+YWNrIFF1ZXJ5IEhhbmRsZXJzIChmb3IgSW5saW5lIEJ1dHRvbnMpIC0tLQpA
+Ym90LmNhbGxiYWNrX3F1ZXJ5X2hhbmRsZXIoZnVuYz1sYW1iZGEgY2FsbDog
+VHJ1ZSkgCmRlZiBoYW5kbGVfY2FsbGJhY2tzKGNhbGwpOgogICAgdXNlcl9p
+ZCA9IGNhbGwuZnJvbV91c2VyLmlkCiAgICBkYXRhID0gY2FsbC5kYXRhCiAg
+ICBsb2dnZXIuaW5mbyhmIkNhbGxiYWNrOiBVc2VyPXt1c2VyX2lkfSwgRGF0
+YT0ne2RhdGF9JyIpCgogICAgaWYgYm90X2xvY2tlZCBhbmQgdXNlcl9pZCBu
+b3QgaW4gYWRtaW5faWRzIGFuZCBkYXRhIG5vdCBpbiBbJ2JhY2tfdG9fbWFp
+bicsICdzcGVlZCcsICdzdGF0cyddOiAjIEFsbG93IHN0YXRzCiAgICAgICAg
+Ym90LmFuc3dlcl9jYWxsYmFja19xdWVyeShjYWxsLmlkLCAi4pqg77iPIEJv
+dCBsb2NrZWQgYnkgYWRtaW4uIiwgc2hvd19hbGVydD1UcnVlKQogICAgICAg
+IHJldHVybgogICAgdHJ5OgogICAgICAgIGlmIGRhdGEgPT0gJ3VwbG9hZCc6
+IHVwbG9hZF9jYWxsYmFjayhjYWxsKQogICAgICAgIGVsaWYgZGF0YSA9PSAn
+Y2hlY2tfZmlsZXMnOiBjaGVja19maWxlc19jYWxsYmFjayhjYWxsKQogICAg
+ICAgIGVsaWYgZGF0YS5zdGFydHN3aXRoKCdmaWxlXycpOiBmaWxlX2NvbnRy
+b2xfY2FsbGJhY2soY2FsbCkKICAgICAgICBlbGlmIGRhdGEuc3RhcnRzd2l0
+aCgnc3RhcnRfJyk6IHN0YXJ0X2JvdF9jYWxsYmFjayhjYWxsKQogICAgICAg
+IGVsaWYgZGF0YS5zdGFydHN3aXRoKCdzdG9wXycpOiBzdG9wX2JvdF9jYWxs
+YmFjayhjYWxsKQogICAgICAgIGVsaWYgZGF0YS5zdGFydHN3aXRoKCdyZXN0
+YXJ0XycpOiByZXN0YXJ0X2JvdF9jYWxsYmFjayhjYWxsKQogICAgICAgIGVs
+aWYgZGF0YS5zdGFydHN3aXRoKCdkZWxldGVfJyk6IGRlbGV0ZV9ib3RfY2Fs
+bGJhY2soY2FsbCkKICAgICAgICBlbGlmIGRhdGEuc3RhcnRzd2l0aCgnbG9n
+c18nKTogbG9nc19ib3RfY2FsbGJhY2soY2FsbCkKICAgICAgICBlbGlmIGRh
+dGEgPT0gJ3NwZWVkJzogc3BlZWRfY2FsbGJhY2soY2FsbCkKICAgICAgICBl
+bGlmIGRhdGEgPT0gJ2JhY2tfdG9fbWFpbic6IGJhY2tfdG9fbWFpbl9jYWxs
+YmFjayhjYWxsKQogICAgICAgIGVsaWYgZGF0YS5zdGFydHN3aXRoKCdjb25m
+aXJtX2Jyb2FkY2FzdF8nKTogaGFuZGxlX2NvbmZpcm1fYnJvYWRjYXN0KGNh
+bGwpCiAgICAgICAgZWxpZiBkYXRhID09ICdjYW5jZWxfYnJvYWRjYXN0Jzog
+aGFuZGxlX2NhbmNlbF9icm9hZGNhc3QoY2FsbCkKICAgICAgICAjIC0tLSBB
+ZG1pbiBDYWxsYmFja3MgLS0tCiAgICAgICAgZWxpZiBkYXRhID09ICdzdWJz
+Y3JpcHRpb24nOiBhZG1pbl9yZXF1aXJlZF9jYWxsYmFjayhjYWxsLCBzdWJz
+Y3JpcHRpb25fbWFuYWdlbWVudF9jYWxsYmFjaykKICAgICAgICBlbGlmIGRh
+dGEgPT0gJ3N0YXRzJzogc3RhdHNfY2FsbGJhY2soY2FsbCkgIyBObyBhZG1p
+biBjaGVjayBoZXJlLCBoYW5kbGVkIGluIGZ1bmMKICAgICAgICBlbGlmIGRh
+dGEgPT0gJ2xvY2tfYm90JzogYWRtaW5fcmVxdWlyZWRfY2FsbGJhY2soY2Fs
+bCwgbG9ja19ib3RfY2FsbGJhY2spCiAgICAgICAgZWxpZiBkYXRhID09ICd1
+bmxvY2tfYm90JzogYWRtaW5fcmVxdWlyZWRfY2FsbGJhY2soY2FsbCwgdW5s
+b2NrX2JvdF9jYWxsYmFjaykKICAgICAgICAjIGVsaWYgZGF0YSA9PSAnZnJl
+ZV9tb2RlJzogYWRtaW5fcmVxdWlyZWRfY2FsbGJhY2soY2FsbCwgdG9nZ2xl
+X2ZyZWVfbW9kZV9jYWxsYmFjaykgIyBSZW1vdmVkCiAgICAgICAgZWxpZiBk
+YXRhID09ICdydW5fYWxsX3NjcmlwdHMnOiBhZG1pbl9yZXF1aXJlZF9jYWxs
+YmFjayhjYWxsLCBydW5fYWxsX3NjcmlwdHNfY2FsbGJhY2spICMgQWRkZWQK
+ICAgICAgICBlbGlmIGRhdGEgPT0gJ2Jyb2FkY2FzdCc6IGFkbWluX3JlcXVp
+cmVkX2NhbGxiYWNrKGNhbGwsIGJyb2FkY2FzdF9pbml0X2NhbGxiYWNrKSAK
+ICAgICAgICBlbGlmIGRhdGEgPT0gJ2FkbWluX3BhbmVsJzogYWRtaW5fcmVx
+dWlyZWRfY2FsbGJhY2soY2FsbCwgYWRtaW5fcGFuZWxfY2FsbGJhY2spCiAg
+ICAgICAgZWxpZiBkYXRhID09ICdhZGRfYWRtaW4nOiBvd25lcl9yZXF1aXJl
+ZF9jYWxsYmFjayhjYWxsLCBhZGRfYWRtaW5faW5pdF9jYWxsYmFjaykgCiAg
+ICAgICAgZWxpZiBkYXRhID09ICdyZW1vdmVfYWRtaW4nOiBvd25lcl9yZXF1
+aXJlZF9jYWxsYmFjayhjYWxsLCByZW1vdmVfYWRtaW5faW5pdF9jYWxsYmFj
+aykgCiAgICAgICAgZWxpZiBkYXRhID09ICdsaXN0X2FkbWlucyc6IGFkbWlu
+X3JlcXVpcmVkX2NhbGxiYWNrKGNhbGwsIGxpc3RfYWRtaW5zX2NhbGxiYWNr
+KQogICAgICAgIGVsaWYgZGF0YSA9PSAnYWRkX3N1YnNjcmlwdGlvbic6IGFk
+bWluX3JlcXVpcmVkX2NhbGxiYWNrKGNhbGwsIGFkZF9zdWJzY3JpcHRpb25f
+aW5pdF9jYWxsYmFjaykgCiAgICAgICAgZWxpZiBkYXRhID09ICdyZW1vdmVf
+c3Vic2NyaXB0aW9uJzogYWRtaW5fcmVxdWlyZWRfY2FsbGJhY2soY2FsbCwg
+cmVtb3ZlX3N1YnNjcmlwdGlvbl9pbml0X2NhbGxiYWNrKSAKICAgICAgICBl
+bGlmIGRhdGEgPT0gJ2NoZWNrX3N1YnNjcmlwdGlvbic6IGFkbWluX3JlcXVp
+cmVkX2NhbGxiYWNrKGNhbGwsIGNoZWNrX3N1YnNjcmlwdGlvbl9pbml0X2Nh
+bGxiYWNrKSAKICAgICAgICBlbHNlOgogICAgICAgICAgICBib3QuYW5zd2Vy
+X2NhbGxiYWNrX3F1ZXJ5KGNhbGwuaWQsICJVbmtub3duIGFjdGlvbi4iKQog
+ICAgICAgICAgICBsb2dnZXIud2FybmluZyhmIlVuaGFuZGxlZCBjYWxsYmFj
+ayBkYXRhOiB7ZGF0YX0gZnJvbSB1c2VyIHt1c2VyX2lkfSIpCiAgICBleGNl
+cHQgRXhjZXB0aW9uIGFzIGU6CiAgICAgICAgbG9nZ2VyLmVycm9yKGYiRXJy
+b3IgaGFuZGxpbmcgY2FsbGJhY2sgJ3tkYXRhfScgZm9yIHt1c2VyX2lkfTog
+e2V9IiwgZXhjX2luZm89VHJ1ZSkKICAgICAgICB0cnk6IGJvdC5hbnN3ZXJf
+Y2FsbGJhY2tfcXVlcnkoY2FsbC5pZCwgIkVycm9yIHByb2Nlc3NpbmcgcmVx
+dWVzdC4iLCBzaG93X2FsZXJ0PVRydWUpCiAgICAgICAgZXhjZXB0IEV4Y2Vw
+dGlvbiBhcyBlX2FuczogbG9nZ2VyLmVycm9yKGYiRmFpbGVkIHRvIGFuc3dl
+ciBjYWxsYmFjayBhZnRlciBlcnJvcjoge2VfYW5zfSIpCgpkZWYgYWRtaW5f
+cmVxdWlyZWRfY2FsbGJhY2soY2FsbCwgZnVuY190b19ydW4pOgogICAgaWYg
+Y2FsbC5mcm9tX3VzZXIuaWQgbm90IGluIGFkbWluX2lkczoKICAgICAgICBi
+b3QuYW5zd2VyX2NhbGxiYWNrX3F1ZXJ5KGNhbGwuaWQsICLimqDvuI8gQWRt
+aW4gcGVybWlzc2lvbnMgcmVxdWlyZWQuIiwgc2hvd19hbGVydD1UcnVlKQog
+ICAgICAgIHJldHVybgogICAgZnVuY190b19ydW4oY2FsbCkgCgpkZWYgb3du
+ZXJfcmVxdWlyZWRfY2FsbGJhY2soY2FsbCwgZnVuY190b19ydW4pOgogICAg
+aWYgY2FsbC5mcm9tX3VzZXIuaWQgIT0gT1dORVJfSUQ6CiAgICAgICAgYm90
+LmFuc3dlcl9jYWxsYmFja19xdWVyeShjYWxsLmlkLCAi4pqg77iPIE93bmVy
+IHBlcm1pc3Npb25zIHJlcXVpcmVkLiIsIHNob3dfYWxlcnQ9VHJ1ZSkKICAg
+ICAgICByZXR1cm4KICAgIGZ1bmNfdG9fcnVuKGNhbGwpCgpkZWYgdXBsb2Fk
+X2NhbGxiYWNrKGNhbGwpOgogICAgdXNlcl9pZCA9IGNhbGwuZnJvbV91c2Vy
+LmlkCiAgICAjIFJlbW92ZWQgZnJlZV9tb2RlIGNoZWNrCiAgICBmaWxlX2xp
+bWl0ID0gZ2V0X3VzZXJfZmlsZV9saW1pdCh1c2VyX2lkKQogICAgY3VycmVu
+dF9maWxlcyA9IGdldF91c2VyX2ZpbGVfY291bnQodXNlcl9pZCkKICAgIGlm
+IGN1cnJlbnRfZmlsZXMgPj0gZmlsZV9saW1pdDoKICAgICAgICBsaW1pdF9z
+dHIgPSBzdHIoZmlsZV9saW1pdCkgaWYgZmlsZV9saW1pdCAhPSBmbG9hdCgn
+aW5mJykgZWxzZSAiVW5saW1pdGVkIgogICAgICAgIGJvdC5hbnN3ZXJfY2Fs
+bGJhY2tfcXVlcnkoY2FsbC5pZCwgZiLimqDvuI8gRmlsZSBsaW1pdCAoe2N1
+cnJlbnRfZmlsZXN9L3tsaW1pdF9zdHJ9KSByZWFjaGVkLiIsIHNob3dfYWxl
+cnQ9VHJ1ZSkKICAgICAgICByZXR1cm4KICAgIGJvdC5hbnN3ZXJfY2FsbGJh
+Y2tfcXVlcnkoY2FsbC5pZCkgCiAgICBib3Quc2VuZF9tZXNzYWdlKGNhbGwu
+bWVzc2FnZS5jaGF0LmlkLCAi8J+TpCBTZW5kIHlvdXIgUHl0aG9uIChgLnB5
+YCksIEpTIChgLmpzYCksIG9yIFpJUCAoYC56aXBgKSBmaWxlLiIpCgpkZWYg
+Y2hlY2tfZmlsZXNfY2FsbGJhY2soY2FsbCk6CiAgICB1c2VyX2lkID0gY2Fs
+bC5mcm9tX3VzZXIuaWQKICAgIGNoYXRfaWQgPSBjYWxsLm1lc3NhZ2UuY2hh
+dC5pZCAKICAgIHVzZXJfZmlsZXNfbGlzdCA9IHVzZXJfZmlsZXMuZ2V0KHVz
+ZXJfaWQsIFtdKQogICAgaWYgbm90IHVzZXJfZmlsZXNfbGlzdDoKICAgICAg
+ICBib3QuYW5zd2VyX2NhbGxiYWNrX3F1ZXJ5KGNhbGwuaWQsICLimqDvuI8g
+Tm8gZmlsZXMgdXBsb2FkZWQuIiwgc2hvd19hbGVydD1UcnVlKQogICAgICAg
+IHRyeToKICAgICAgICAgICAgbWFya3VwID0gdHlwZXMuSW5saW5lS2V5Ym9h
+cmRNYXJrdXAoKQogICAgICAgICAgICBtYXJrdXAuYWRkKHR5cGVzLklubGlu
+ZUtleWJvYXJkQnV0dG9uKCLwn5SZIEJhY2sgdG8gTWFpbiIsIGNhbGxiYWNr
+X2RhdGE9J2JhY2tfdG9fbWFpbicpKQogICAgICAgICAgICBib3QuZWRpdF9t
+ZXNzYWdlX3RleHQoIvCfk4IgWW91ciBmaWxlczpcblxuKE5vIGZpbGVzIHVw
+bG9hZGVkKSIsIGNoYXRfaWQsIGNhbGwubWVzc2FnZS5tZXNzYWdlX2lkLCBy
+ZXBseV9tYXJrdXA9bWFya3VwKQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb24g
+YXMgZTogbG9nZ2VyLmVycm9yKGYiRXJyb3IgZWRpdGluZyBtc2cgZm9yIGVt
+cHR5IGZpbGUgbGlzdDoge2V9IikKICAgICAgICByZXR1cm4KICAgIGJvdC5h
+bnN3ZXJfY2FsbGJhY2tfcXVlcnkoY2FsbC5pZCkgCiAgICBtYXJrdXAgPSB0
+eXBlcy5JbmxpbmVLZXlib2FyZE1hcmt1cChyb3dfd2lkdGg9MSkgCiAgICBm
+b3IgZmlsZV9uYW1lLCBmaWxlX3R5cGUgaW4gc29ydGVkKHVzZXJfZmlsZXNf
+bGlzdCk6IAogICAgICAgIGlzX3J1bm5pbmcgPSBpc19ib3RfcnVubmluZyh1
+c2VyX2lkLCBmaWxlX25hbWUpICMgVXNlIHVzZXJfaWQgZm9yIHN0YXR1cyBj
+aGVjawogICAgICAgIHN0YXR1c19pY29uID0gIvCfn6IgUnVubmluZyIgaWYg
+aXNfcnVubmluZyBlbHNlICLwn5S0IFN0b3BwZWQiCiAgICAgICAgYnRuX3Rl
+eHQgPSBmIntmaWxlX25hbWV9ICh7ZmlsZV90eXBlfSkgLSB7c3RhdHVzX2lj
+b259IgogICAgICAgICMgQ2FsbGJhY2sgaW5jbHVkZXMgdXNlcl9pZCBhcyBz
+Y3JpcHRfb3duZXJfaWQKICAgICAgICBtYXJrdXAuYWRkKHR5cGVzLklubGlu
+ZUtleWJvYXJkQnV0dG9uKGJ0bl90ZXh0LCBjYWxsYmFja19kYXRhPWYnZmls
+ZV97dXNlcl9pZH1fe2ZpbGVfbmFtZX0nKSkKICAgIG1hcmt1cC5hZGQodHlw
+ZXMuSW5saW5lS2V5Ym9hcmRCdXR0b24oIvCflJkgQmFjayB0byBNYWluIiwg
+Y2FsbGJhY2tfZGF0YT0nYmFja190b19tYWluJykpCiAgICB0cnk6CiAgICAg
+ICAgYm90LmVkaXRfbWVzc2FnZV90ZXh0KCLwn5OCIFlvdXIgZmlsZXM6XG5D
+bGljayB0byBtYW5hZ2UuIiwgY2hhdF9pZCwgY2FsbC5tZXNzYWdlLm1lc3Nh
+Z2VfaWQsIHJlcGx5X21hcmt1cD1tYXJrdXAsIHBhcnNlX21vZGU9J01hcmtk
+b3duJykKICAgIGV4Y2VwdCB0ZWxlYm90LmFwaWhlbHBlci5BcGlUZWxlZ3Jh
+bUV4Y2VwdGlvbiBhcyBlOgogICAgICAgICBpZiAibWVzc2FnZSBpcyBub3Qg
+bW9kaWZpZWQiIGluIHN0cihlKTogbG9nZ2VyLndhcm5pbmcoIk1zZyBub3Qg
+bW9kaWZpZWQgKGZpbGVzKS4iKQogICAgICAgICBlbHNlOiBsb2dnZXIuZXJy
+b3IoZiJFcnJvciBlZGl0aW5nIG1zZyBmb3IgZmlsZSBsaXN0OiB7ZX0iKQog
+ICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOiBsb2dnZXIuZXJyb3IoZiJVbmV4
+cGVjdGVkIGVycm9yIGVkaXRpbmcgbXNnIGZvciBmaWxlIGxpc3Q6IHtlfSIs
+IGV4Y19pbmZvPVRydWUpCgpkZWYgZmlsZV9jb250cm9sX2NhbGxiYWNrKGNh
+bGwpOgogICAgdHJ5OgogICAgICAgIF8sIHNjcmlwdF9vd25lcl9pZF9zdHIs
+IGZpbGVfbmFtZSA9IGNhbGwuZGF0YS5zcGxpdCgnXycsIDIpCiAgICAgICAg
+c2NyaXB0X293bmVyX2lkID0gaW50KHNjcmlwdF9vd25lcl9pZF9zdHIpCiAg
+ICAgICAgcmVxdWVzdGluZ191c2VyX2lkID0gY2FsbC5mcm9tX3VzZXIuaWQK
+CiAgICAgICAgIyBBbGxvdyBvd25lci9hZG1pbiB0byBjb250cm9sIGFueSBm
+aWxlLCBvciB1c2VyIHRvIGNvbnRyb2wgdGhlaXIgb3duCiAgICAgICAgaWYg
+bm90IChyZXF1ZXN0aW5nX3VzZXJfaWQgPT0gc2NyaXB0X293bmVyX2lkIG9y
+IHJlcXVlc3RpbmdfdXNlcl9pZCBpbiBhZG1pbl9pZHMpOgogICAgICAgICAg
+ICBsb2dnZXIud2FybmluZyhmIlVzZXIge3JlcXVlc3RpbmdfdXNlcl9pZH0g
+dHJpZWQgdG8gYWNjZXNzIGZpbGUgJ3tmaWxlX25hbWV9JyBvZiB1c2VyIHtz
+Y3JpcHRfb3duZXJfaWR9IHdpdGhvdXQgcGVybWlzc2lvbi4iKQogICAgICAg
+ICAgICBib3QuYW5zd2VyX2NhbGxiYWNrX3F1ZXJ5KGNhbGwuaWQsICLimqDv
+uI8gWW91IGNhbiBvbmx5IG1hbmFnZSB5b3VyIG93biBmaWxlcy4iLCBzaG93
+X2FsZXJ0PVRydWUpCiAgICAgICAgICAgIGNoZWNrX2ZpbGVzX2NhbGxiYWNr
+KGNhbGwpICMgU2hvdyB0aGVpciBvd24gZmlsZXMKICAgICAgICAgICAgcmV0
+dXJuCgogICAgICAgIHVzZXJfZmlsZXNfbGlzdCA9IHVzZXJfZmlsZXMuZ2V0
+KHNjcmlwdF9vd25lcl9pZCwgW10pCiAgICAgICAgaWYgbm90IGFueShmWzBd
+ID09IGZpbGVfbmFtZSBmb3IgZiBpbiB1c2VyX2ZpbGVzX2xpc3QpOgogICAg
+ICAgICAgICBsb2dnZXIud2FybmluZyhmIkZpbGUgJ3tmaWxlX25hbWV9JyBu
+b3QgZm91bmQgZm9yIHVzZXIge3NjcmlwdF9vd25lcl9pZH0gZHVyaW5nIGNv
+bnRyb2wuIikKICAgICAgICAgICAgYm90LmFuc3dlcl9jYWxsYmFja19xdWVy
+eShjYWxsLmlkLCAi4pqg77iPIEZpbGUgbm90IGZvdW5kLiIsIHNob3dfYWxl
+cnQ9VHJ1ZSkKICAgICAgICAgICAgIyBJZiBhZG1pbiB3YXMgdmlld2luZywg
+dGhpcyBtaWdodCBiZSBjb25mdXNpbmcuIEZvciBub3csIGp1c3Qgc2hvdyB0
+aGVpciBvd24uCiAgICAgICAgICAgIGNoZWNrX2ZpbGVzX2NhbGxiYWNrKGNh
+bGwpIAogICAgICAgICAgICByZXR1cm4KCiAgICAgICAgYm90LmFuc3dlcl9j
+YWxsYmFja19xdWVyeShjYWxsLmlkKSAKICAgICAgICBpc19ydW5uaW5nID0g
+aXNfYm90X3J1bm5pbmcoc2NyaXB0X293bmVyX2lkLCBmaWxlX25hbWUpCiAg
+ICAgICAgc3RhdHVzX3RleHQgPSAn8J+foiBSdW5uaW5nJyBpZiBpc19ydW5u
+aW5nIGVsc2UgJ/CflLQgU3RvcHBlZCcKICAgICAgICBmaWxlX3R5cGUgPSBu
+ZXh0KChmWzFdIGZvciBmIGluIHVzZXJfZmlsZXNfbGlzdCBpZiBmWzBdID09
+IGZpbGVfbmFtZSksICc/JykgCiAgICAgICAgdHJ5OgogICAgICAgICAgICBi
+b3QuZWRpdF9tZXNzYWdlX3RleHQoCiAgICAgICAgICAgICAgICBmIuKame+4
+jyBDb250cm9scyBmb3I6IGB7ZmlsZV9uYW1lfWAgKHtmaWxlX3R5cGV9KSBv
+ZiBVc2VyIGB7c2NyaXB0X293bmVyX2lkfWBcblN0YXR1czoge3N0YXR1c190
+ZXh0fSIsCiAgICAgICAgICAgICAgICBjYWxsLm1lc3NhZ2UuY2hhdC5pZCwg
+Y2FsbC5tZXNzYWdlLm1lc3NhZ2VfaWQsCiAgICAgICAgICAgICAgICByZXBs
+eV9tYXJrdXA9Y3JlYXRlX2NvbnRyb2xfYnV0dG9ucyhzY3JpcHRfb3duZXJf
+aWQsIGZpbGVfbmFtZSwgaXNfcnVubmluZyksCiAgICAgICAgICAgICAgICBw
+YXJzZV9tb2RlPSdNYXJrZG93bicKICAgICAgICAgICAgKQogICAgICAgIGV4
+Y2VwdCB0ZWxlYm90LmFwaWhlbHBlci5BcGlUZWxlZ3JhbUV4Y2VwdGlvbiBh
+cyBlOgogICAgICAgICAgICAgaWYgIm1lc3NhZ2UgaXMgbm90IG1vZGlmaWVk
+IiBpbiBzdHIoZSk6IGxvZ2dlci53YXJuaW5nKGYiTXNnIG5vdCBtb2RpZmll
+ZCAoY29udHJvbHMgZm9yIHtmaWxlX25hbWV9KSIpCiAgICAgICAgICAgICBl
+bHNlOiByYWlzZSAKICAgIGV4Y2VwdCAoVmFsdWVFcnJvciwgSW5kZXhFcnJv
+cikgYXMgdmU6CiAgICAgICAgbG9nZ2VyLmVycm9yKGYiRXJyb3IgcGFyc2lu
+ZyBmaWxlIGNvbnRyb2wgY2FsbGJhY2s6IHt2ZX0uIERhdGE6ICd7Y2FsbC5k
+YXRhfSciKQogICAgICAgIGJvdC5hbnN3ZXJfY2FsbGJhY2tfcXVlcnkoY2Fs
+bC5pZCwgIkVycm9yOiBJbnZhbGlkIGFjdGlvbiBkYXRhLiIsIHNob3dfYWxl
+cnQ9VHJ1ZSkKICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICBs
+b2dnZXIuZXJyb3IoZiJFcnJvciBpbiBmaWxlX2NvbnRyb2xfY2FsbGJhY2sg
+Zm9yIGRhdGEgJ3tjYWxsLmRhdGF9Jzoge2V9IiwgZXhjX2luZm89VHJ1ZSkK
+ICAgICAgICBib3QuYW5zd2VyX2NhbGxiYWNrX3F1ZXJ5KGNhbGwuaWQsICJB
+biBlcnJvciBvY2N1cnJlZC4iLCBzaG93X2FsZXJ0PVRydWUpCgpkZWYgc3Rh
+cnRfYm90X2NhbGxiYWNrKGNhbGwpOgogICAgdHJ5OgogICAgICAgIF8sIHNj
+cmlwdF9vd25lcl9pZF9zdHIsIGZpbGVfbmFtZSA9IGNhbGwuZGF0YS5zcGxp
+dCgnXycsIDIpCiAgICAgICAgc2NyaXB0X293bmVyX2lkID0gaW50KHNjcmlw
+dF9vd25lcl9pZF9zdHIpCiAgICAgICAgcmVxdWVzdGluZ191c2VyX2lkID0g
+Y2FsbC5mcm9tX3VzZXIuaWQKICAgICAgICBjaGF0X2lkX2Zvcl9yZXBseSA9
+IGNhbGwubWVzc2FnZS5jaGF0LmlkICMgV2hlcmUgdGhlIGFkbWluL3VzZXIg
+Z2V0cyB0aGUgcmVwbHkKCiAgICAgICAgbG9nZ2VyLmluZm8oZiJTdGFydCBy
+ZXF1ZXN0OiBSZXF1ZXN0ZXI9e3JlcXVlc3RpbmdfdXNlcl9pZH0sIE93bmVy
+PXtzY3JpcHRfb3duZXJfaWR9LCBGaWxlPSd7ZmlsZV9uYW1lfSciKQoKICAg
+ICAgICBpZiBub3QgKHJlcXVlc3RpbmdfdXNlcl9pZCA9PSBzY3JpcHRfb3du
+ZXJfaWQgb3IgcmVxdWVzdGluZ191c2VyX2lkIGluIGFkbWluX2lkcyk6CiAg
+ICAgICAgICAgIGJvdC5hbnN3ZXJfY2FsbGJhY2tfcXVlcnkoY2FsbC5pZCwg
+IuKaoO+4jyBQZXJtaXNzaW9uIGRlbmllZCB0byBzdGFydCB0aGlzIHNjcmlw
+dC4iLCBzaG93X2FsZXJ0PVRydWUpOyByZXR1cm4KCiAgICAgICAgdXNlcl9m
+aWxlc19saXN0ID0gdXNlcl9maWxlcy5nZXQoc2NyaXB0X293bmVyX2lkLCBb
+XSkKICAgICAgICBmaWxlX2luZm8gPSBuZXh0KChmIGZvciBmIGluIHVzZXJf
+ZmlsZXNfbGlzdCBpZiBmWzBdID09IGZpbGVfbmFtZSksIE5vbmUpCiAgICAg
+ICAgaWYgbm90IGZpbGVfaW5mbzoKICAgICAgICAgICAgYm90LmFuc3dlcl9j
+YWxsYmFja19xdWVyeShjYWxsLmlkLCAi4pqg77iPIEZpbGUgbm90IGZvdW5k
+LiIsIHNob3dfYWxlcnQ9VHJ1ZSk7IGNoZWNrX2ZpbGVzX2NhbGxiYWNrKGNh
+bGwpOyByZXR1cm4KCiAgICAgICAgZmlsZV90eXBlID0gZmlsZV9pbmZvWzFd
+CiAgICAgICAgdXNlcl9mb2xkZXIgPSBnZXRfdXNlcl9mb2xkZXIoc2NyaXB0
+X293bmVyX2lkKQogICAgICAgIGZpbGVfcGF0aCA9IG9zLnBhdGguam9pbih1
+c2VyX2ZvbGRlciwgZmlsZV9uYW1lKQoKICAgICAgICBpZiBub3Qgb3MucGF0
+aC5leGlzdHMoZmlsZV9wYXRoKToKICAgICAgICAgICAgYm90LmFuc3dlcl9j
+YWxsYmFja19xdWVyeShjYWxsLmlkLCBmIuKaoO+4jyBFcnJvcjogRmlsZSBg
+e2ZpbGVfbmFtZX1gIG1pc3NpbmchIFJlLXVwbG9hZC4iLCBzaG93X2FsZXJ0
+PVRydWUpCiAgICAgICAgICAgIHJlbW92ZV91c2VyX2ZpbGVfZGIoc2NyaXB0
+X293bmVyX2lkLCBmaWxlX25hbWUpOyBjaGVja19maWxlc19jYWxsYmFjayhj
+YWxsKTsgcmV0dXJuCgogICAgICAgIGlmIGlzX2JvdF9ydW5uaW5nKHNjcmlw
+dF9vd25lcl9pZCwgZmlsZV9uYW1lKToKICAgICAgICAgICAgYm90LmFuc3dl
+cl9jYWxsYmFja19xdWVyeShjYWxsLmlkLCBmIuKaoO+4jyBTY3JpcHQgJ3tm
+aWxlX25hbWV9JyBhbHJlYWR5IHJ1bm5pbmcuIiwgc2hvd19hbGVydD1UcnVl
+KQogICAgICAgICAgICB0cnk6IGJvdC5lZGl0X21lc3NhZ2VfcmVwbHlfbWFy
+a3VwKGNoYXRfaWRfZm9yX3JlcGx5LCBjYWxsLm1lc3NhZ2UubWVzc2FnZV9p
+ZCwgcmVwbHlfbWFya3VwPWNyZWF0ZV9jb250cm9sX2J1dHRvbnMoc2NyaXB0
+X293bmVyX2lkLCBmaWxlX25hbWUsIFRydWUpKQogICAgICAgICAgICBleGNl
+cHQgRXhjZXB0aW9uIGFzIGU6IGxvZ2dlci5lcnJvcihmIkVycm9yIHVwZGF0
+aW5nIGJ1dHRvbnMgKGFscmVhZHkgcnVubmluZyk6IHtlfSIpCiAgICAgICAg
+ICAgIHJldHVybgoKICAgICAgICBib3QuYW5zd2VyX2NhbGxiYWNrX3F1ZXJ5
+KGNhbGwuaWQsIGYi4o+zIEF0dGVtcHRpbmcgdG8gc3RhcnQge2ZpbGVfbmFt
+ZX0gZm9yIHVzZXIge3NjcmlwdF9vd25lcl9pZH0uLi4iKQoKICAgICAgICAj
+IFBhc3MgY2FsbC5tZXNzYWdlIGFzIG1lc3NhZ2Vfb2JqX2Zvcl9yZXBseSBz
+byBmZWVkYmFjayBnb2VzIHRvIHRoZSBwZXJzb24gd2hvIGNsaWNrZWQKICAg
+ICAgICBpZiBmaWxlX3R5cGUgPT0gJ3B5JzoKICAgICAgICAgICAgdGhyZWFk
+aW5nLlRocmVhZCh0YXJnZXQ9cnVuX3NjcmlwdCwgYXJncz0oZmlsZV9wYXRo
+LCBzY3JpcHRfb3duZXJfaWQsIHVzZXJfZm9sZGVyLCBmaWxlX25hbWUsIGNh
+bGwubWVzc2FnZSkpLnN0YXJ0KCkKICAgICAgICBlbGlmIGZpbGVfdHlwZSA9
+PSAnanMnOgogICAgICAgICAgICB0aHJlYWRpbmcuVGhyZWFkKHRhcmdldD1y
+dW5fanNfc2NyaXB0LCBhcmdzPShmaWxlX3BhdGgsIHNjcmlwdF9vd25lcl9p
+ZCwgdXNlcl9mb2xkZXIsIGZpbGVfbmFtZSwgY2FsbC5tZXNzYWdlKSkuc3Rh
+cnQoKQogICAgICAgIGVsc2U6CiAgICAgICAgICAgICBib3Quc2VuZF9tZXNz
+YWdlKGNoYXRfaWRfZm9yX3JlcGx5LCBmIuKdjCBFcnJvcjogVW5rbm93biBm
+aWxlIHR5cGUgJ3tmaWxlX3R5cGV9JyBmb3IgJ3tmaWxlX25hbWV9Jy4iKTsg
+cmV0dXJuIAoKICAgICAgICB0aW1lLnNsZWVwKDEuNSkgIyBHaXZlIHNjcmlw
+dCB0aW1lIHRvIGFjdHVhbGx5IHN0YXJ0IG9yIGZhaWwgZWFybHkKICAgICAg
+ICBpc19ub3dfcnVubmluZyA9IGlzX2JvdF9ydW5uaW5nKHNjcmlwdF9vd25l
+cl9pZCwgZmlsZV9uYW1lKSAKICAgICAgICBzdGF0dXNfdGV4dCA9ICfwn5+i
+IFJ1bm5pbmcnIGlmIGlzX25vd19ydW5uaW5nIGVsc2UgJ/Cfn6EgU3RhcnRp
+bmcgKG9yIGZhaWxlZCwgY2hlY2sgbG9ncy9yZXBsaWVzKScKICAgICAgICB0
+cnk6CiAgICAgICAgICAgIGJvdC5lZGl0X21lc3NhZ2VfdGV4dCgKICAgICAg
+ICAgICAgICAgIGYi4pqZ77iPIENvbnRyb2xzIGZvcjogYHtmaWxlX25hbWV9
+YCAoe2ZpbGVfdHlwZX0pIG9mIFVzZXIgYHtzY3JpcHRfb3duZXJfaWR9YFxu
+U3RhdHVzOiB7c3RhdHVzX3RleHR9IiwKICAgICAgICAgICAgICAgIGNoYXRf
+aWRfZm9yX3JlcGx5LCBjYWxsLm1lc3NhZ2UubWVzc2FnZV9pZCwKICAgICAg
+ICAgICAgICAgIHJlcGx5X21hcmt1cD1jcmVhdGVfY29udHJvbF9idXR0b25z
+KHNjcmlwdF9vd25lcl9pZCwgZmlsZV9uYW1lLCBpc19ub3dfcnVubmluZyks
+IHBhcnNlX21vZGU9J01hcmtkb3duJwogICAgICAgICAgICApCiAgICAgICAg
+ZXhjZXB0IHRlbGVib3QuYXBpaGVscGVyLkFwaVRlbGVncmFtRXhjZXB0aW9u
+IGFzIGU6CiAgICAgICAgICAgICBpZiAibWVzc2FnZSBpcyBub3QgbW9kaWZp
+ZWQiIGluIHN0cihlKTogbG9nZ2VyLndhcm5pbmcoZiJNc2cgbm90IG1vZGlm
+aWVkIGFmdGVyIHN0YXJ0aW5nIHtmaWxlX25hbWV9IikKICAgICAgICAgICAg
+IGVsc2U6IHJhaXNlCiAgICBleGNlcHQgKFZhbHVlRXJyb3IsIEluZGV4RXJy
+b3IpIGFzIGU6CiAgICAgICAgbG9nZ2VyLmVycm9yKGYiRXJyb3IgcGFyc2lu
+ZyBzdGFydCBjYWxsYmFjayAne2NhbGwuZGF0YX0nOiB7ZX0iKQogICAgICAg
+IGJvdC5hbnN3ZXJfY2FsbGJhY2tfcXVlcnkoY2FsbC5pZCwgIkVycm9yOiBJ
+bnZhbGlkIHN0YXJ0IGNvbW1hbmQuIiwgc2hvd19hbGVydD1UcnVlKQogICAg
+ZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgIGxvZ2dlci5lcnJvcihm
+IkVycm9yIGluIHN0YXJ0X2JvdF9jYWxsYmFjayBmb3IgJ3tjYWxsLmRhdGF9
+Jzoge2V9IiwgZXhjX2luZm89VHJ1ZSkKICAgICAgICBib3QuYW5zd2VyX2Nh
+bGxiYWNrX3F1ZXJ5KGNhbGwuaWQsICJFcnJvciBzdGFydGluZyBzY3JpcHQu
+Iiwgc2hvd19hbGVydD1UcnVlKQogICAgICAgIHRyeTogIyBBdHRlbXB0IHRv
+IHJlc2V0IGJ1dHRvbnMgdG8gJ3N0b3BwZWQnIHN0YXRlIG9uIGVycm9yCiAg
+ICAgICAgICAgIF8sIHNjcmlwdF9vd25lcl9pZF9lcnJfc3RyLCBmaWxlX25h
+bWVfZXJyID0gY2FsbC5kYXRhLnNwbGl0KCdfJywgMikKICAgICAgICAgICAg
+c2NyaXB0X293bmVyX2lkX2VyciA9IGludChzY3JpcHRfb3duZXJfaWRfZXJy
+X3N0cikKICAgICAgICAgICAgYm90LmVkaXRfbWVzc2FnZV9yZXBseV9tYXJr
+dXAoY2FsbC5tZXNzYWdlLmNoYXQuaWQsIGNhbGwubWVzc2FnZS5tZXNzYWdl
+X2lkLCByZXBseV9tYXJrdXA9Y3JlYXRlX2NvbnRyb2xfYnV0dG9ucyhzY3Jp
+cHRfb3duZXJfaWRfZXJyLCBmaWxlX25hbWVfZXJyLCBGYWxzZSkpCiAgICAg
+ICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlX2J0bjogbG9nZ2VyLmVycm9yKGYi
+RmFpbGVkIHRvIHVwZGF0ZSBidXR0b25zIGFmdGVyIHN0YXJ0IGVycm9yOiB7
+ZV9idG59IikKCmRlZiBzdG9wX2JvdF9jYWxsYmFjayhjYWxsKToKICAgIHRy
+eToKICAgICAgICBfLCBzY3JpcHRfb3duZXJfaWRfc3RyLCBmaWxlX25hbWUg
+PSBjYWxsLmRhdGEuc3BsaXQoJ18nLCAyKQogICAgICAgIHNjcmlwdF9vd25l
+cl9pZCA9IGludChzY3JpcHRfb3duZXJfaWRfc3RyKQogICAgICAgIHJlcXVl
+c3RpbmdfdXNlcl9pZCA9IGNhbGwuZnJvbV91c2VyLmlkCiAgICAgICAgY2hh
+dF9pZF9mb3JfcmVwbHkgPSBjYWxsLm1lc3NhZ2UuY2hhdC5pZAoKICAgICAg
+ICBsb2dnZXIuaW5mbyhmIlN0b3AgcmVxdWVzdDogUmVxdWVzdGVyPXtyZXF1
+ZXN0aW5nX3VzZXJfaWR9LCBPd25lcj17c2NyaXB0X293bmVyX2lkfSwgRmls
+ZT0ne2ZpbGVfbmFtZX0nIikKICAgICAgICBpZiBub3QgKHJlcXVlc3Rpbmdf
+dXNlcl9pZCA9PSBzY3JpcHRfb3duZXJfaWQgb3IgcmVxdWVzdGluZ191c2Vy
+X2lkIGluIGFkbWluX2lkcyk6CiAgICAgICAgICAgIGJvdC5hbnN3ZXJfY2Fs
+bGJhY2tfcXVlcnkoY2FsbC5pZCwgIuKaoO+4jyBQZXJtaXNzaW9uIGRlbmll
+ZC4iLCBzaG93X2FsZXJ0PVRydWUpOyByZXR1cm4KCiAgICAgICAgdXNlcl9m
+aWxlc19saXN0ID0gdXNlcl9maWxlcy5nZXQoc2NyaXB0X293bmVyX2lkLCBb
+XSkKICAgICAgICBmaWxlX2luZm8gPSBuZXh0KChmIGZvciBmIGluIHVzZXJf
+ZmlsZXNfbGlzdCBpZiBmWzBdID09IGZpbGVfbmFtZSksIE5vbmUpCiAgICAg
+ICAgaWYgbm90IGZpbGVfaW5mbzoKICAgICAgICAgICAgYm90LmFuc3dlcl9j
+YWxsYmFja19xdWVyeShjYWxsLmlkLCAi4pqg77iPIEZpbGUgbm90IGZvdW5k
+LiIsIHNob3dfYWxlcnQ9VHJ1ZSk7IGNoZWNrX2ZpbGVzX2NhbGxiYWNrKGNh
+bGwpOyByZXR1cm4KCiAgICAgICAgZmlsZV90eXBlID0gZmlsZV9pbmZvWzFd
+IAogICAgICAgIHNjcmlwdF9rZXkgPSBmIntzY3JpcHRfb3duZXJfaWR9X3tm
+aWxlX25hbWV9IgoKICAgICAgICBpZiBub3QgaXNfYm90X3J1bm5pbmcoc2Ny
+aXB0X293bmVyX2lkLCBmaWxlX25hbWUpOiAKICAgICAgICAgICAgYm90LmFu
+c3dlcl9jYWxsYmFja19xdWVyeShjYWxsLmlkLCBmIuKaoO+4jyBTY3JpcHQg
+J3tmaWxlX25hbWV9JyBhbHJlYWR5IHN0b3BwZWQuIiwgc2hvd19hbGVydD1U
+cnVlKQogICAgICAgICAgICB0cnk6CiAgICAgICAgICAgICAgICAgYm90LmVk
+aXRfbWVzc2FnZV90ZXh0KAogICAgICAgICAgICAgICAgICAgICBmIuKame+4
+jyBDb250cm9scyBmb3I6IGB7ZmlsZV9uYW1lfWAgKHtmaWxlX3R5cGV9KSBv
+ZiBVc2VyIGB7c2NyaXB0X293bmVyX2lkfWBcblN0YXR1czog8J+UtCBTdG9w
+cGVkIiwKICAgICAgICAgICAgICAgICAgICAgY2hhdF9pZF9mb3JfcmVwbHks
+IGNhbGwubWVzc2FnZS5tZXNzYWdlX2lkLAogICAgICAgICAgICAgICAgICAg
+ICByZXBseV9tYXJrdXA9Y3JlYXRlX2NvbnRyb2xfYnV0dG9ucyhzY3JpcHRf
+b3duZXJfaWQsIGZpbGVfbmFtZSwgRmFsc2UpLCBwYXJzZV9tb2RlPSdNYXJr
+ZG93bicpCiAgICAgICAgICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZTogbG9n
+Z2VyLmVycm9yKGYiRXJyb3IgdXBkYXRpbmcgYnV0dG9ucyAoYWxyZWFkeSBz
+dG9wcGVkKToge2V9IikKICAgICAgICAgICAgcmV0dXJuCgogICAgICAgIGJv
+dC5hbnN3ZXJfY2FsbGJhY2tfcXVlcnkoY2FsbC5pZCwgZiLij7MgU3RvcHBp
+bmcge2ZpbGVfbmFtZX0gZm9yIHVzZXIge3NjcmlwdF9vd25lcl9pZH0uLi4i
+KQogICAgICAgIHByb2Nlc3NfaW5mbyA9IGJvdF9zY3JpcHRzLmdldChzY3Jp
+cHRfa2V5KQogICAgICAgIGlmIHByb2Nlc3NfaW5mbzoKICAgICAgICAgICAg
+a2lsbF9wcm9jZXNzX3RyZWUocHJvY2Vzc19pbmZvKQogICAgICAgICAgICBp
+ZiBzY3JpcHRfa2V5IGluIGJvdF9zY3JpcHRzOiBkZWwgYm90X3NjcmlwdHNb
+c2NyaXB0X2tleV07IGxvZ2dlci5pbmZvKGYiUmVtb3ZlZCB7c2NyaXB0X2tl
+eX0gZnJvbSBydW5uaW5nIGFmdGVyIHN0b3AuIikKICAgICAgICBlbHNlOiBs
+b2dnZXIud2FybmluZyhmIlNjcmlwdCB7c2NyaXB0X2tleX0gcnVubmluZyBi
+eSBwc3V0aWwgYnV0IG5vdCBpbiBib3Rfc2NyaXB0cyBkaWN0LiIpCgogICAg
+ICAgIHRyeToKICAgICAgICAgICAgYm90LmVkaXRfbWVzc2FnZV90ZXh0KAog
+ICAgICAgICAgICAgICAgZiLimpnvuI8gQ29udHJvbHMgZm9yOiBge2ZpbGVf
+bmFtZX1gICh7ZmlsZV90eXBlfSkgb2YgVXNlciBge3NjcmlwdF9vd25lcl9p
+ZH1gXG5TdGF0dXM6IPCflLQgU3RvcHBlZCIsCiAgICAgICAgICAgICAgICBj
+aGF0X2lkX2Zvcl9yZXBseSwgY2FsbC5tZXNzYWdlLm1lc3NhZ2VfaWQsCiAg
+ICAgICAgICAgICAgICByZXBseV9tYXJrdXA9Y3JlYXRlX2NvbnRyb2xfYnV0
+dG9ucyhzY3JpcHRfb3duZXJfaWQsIGZpbGVfbmFtZSwgRmFsc2UpLCBwYXJz
+ZV9tb2RlPSdNYXJrZG93bicKICAgICAgICAgICAgKQogICAgICAgIGV4Y2Vw
+dCB0ZWxlYm90LmFwaWhlbHBlci5BcGlUZWxlZ3JhbUV4Y2VwdGlvbiBhcyBl
+OgogICAgICAgICAgICAgaWYgIm1lc3NhZ2UgaXMgbm90IG1vZGlmaWVkIiBp
+biBzdHIoZSk6IGxvZ2dlci53YXJuaW5nKGYiTXNnIG5vdCBtb2RpZmllZCBh
+ZnRlciBzdG9wcGluZyB7ZmlsZV9uYW1lfSIpCiAgICAgICAgICAgICBlbHNl
+OiByYWlzZQogICAgZXhjZXB0IChWYWx1ZUVycm9yLCBJbmRleEVycm9yKSBh
+cyBlOgogICAgICAgIGxvZ2dlci5lcnJvcihmIkVycm9yIHBhcnNpbmcgc3Rv
+cCBjYWxsYmFjayAne2NhbGwuZGF0YX0nOiB7ZX0iKQogICAgICAgIGJvdC5h
+bnN3ZXJfY2FsbGJhY2tfcXVlcnkoY2FsbC5pZCwgIkVycm9yOiBJbnZhbGlk
+IHN0b3AgY29tbWFuZC4iLCBzaG93X2FsZXJ0PVRydWUpCiAgICBleGNlcHQg
+RXhjZXB0aW9uIGFzIGU6CiAgICAgICAgbG9nZ2VyLmVycm9yKGYiRXJyb3Ig
+aW4gc3RvcF9ib3RfY2FsbGJhY2sgZm9yICd7Y2FsbC5kYXRhfSc6IHtlfSIs
+IGV4Y19pbmZvPVRydWUpCiAgICAgICAgYm90LmFuc3dlcl9jYWxsYmFja19x
+dWVyeShjYWxsLmlkLCAiRXJyb3Igc3RvcHBpbmcgc2NyaXB0LiIsIHNob3df
+YWxlcnQ9VHJ1ZSkKCmRlZiByZXN0YXJ0X2JvdF9jYWxsYmFjayhjYWxsKToK
+ICAgIHRyeToKICAgICAgICBfLCBzY3JpcHRfb3duZXJfaWRfc3RyLCBmaWxl
+X25hbWUgPSBjYWxsLmRhdGEuc3BsaXQoJ18nLCAyKQogICAgICAgIHNjcmlw
+dF9vd25lcl9pZCA9IGludChzY3JpcHRfb3duZXJfaWRfc3RyKQogICAgICAg
+IHJlcXVlc3RpbmdfdXNlcl9pZCA9IGNhbGwuZnJvbV91c2VyLmlkCiAgICAg
+ICAgY2hhdF9pZF9mb3JfcmVwbHkgPSBjYWxsLm1lc3NhZ2UuY2hhdC5pZAoK
+ICAgICAgICBsb2dnZXIuaW5mbyhmIlJlc3RhcnQ6IFJlcXVlc3Rlcj17cmVx
+dWVzdGluZ191c2VyX2lkfSwgT3duZXI9e3NjcmlwdF9vd25lcl9pZH0sIEZp
+bGU9J3tmaWxlX25hbWV9JyIpCiAgICAgICAgaWYgbm90IChyZXF1ZXN0aW5n
+X3VzZXJfaWQgPT0gc2NyaXB0X293bmVyX2lkIG9yIHJlcXVlc3RpbmdfdXNl
+cl9pZCBpbiBhZG1pbl9pZHMpOgogICAgICAgICAgICBib3QuYW5zd2VyX2Nh
+bGxiYWNrX3F1ZXJ5KGNhbGwuaWQsICLimqDvuI8gUGVybWlzc2lvbiBkZW5p
+ZWQuIiwgc2hvd19hbGVydD1UcnVlKTsgcmV0dXJuCgogICAgICAgIHVzZXJf
+ZmlsZXNfbGlzdCA9IHVzZXJfZmlsZXMuZ2V0KHNjcmlwdF9vd25lcl9pZCwg
+W10pCiAgICAgICAgZmlsZV9pbmZvID0gbmV4dCgoZiBmb3IgZiBpbiB1c2Vy
+X2ZpbGVzX2xpc3QgaWYgZlswXSA9PSBmaWxlX25hbWUpLCBOb25lKQogICAg
+ICAgIGlmIG5vdCBmaWxlX2luZm86CiAgICAgICAgICAgIGJvdC5hbnN3ZXJf
+Y2FsbGJhY2tfcXVlcnkoY2FsbC5pZCwgIuKaoO+4jyBGaWxlIG5vdCBmb3Vu
+ZC4iLCBzaG93X2FsZXJ0PVRydWUpOyBjaGVja19maWxlc19jYWxsYmFjayhj
+YWxsKTsgcmV0dXJuCgogICAgICAgIGZpbGVfdHlwZSA9IGZpbGVfaW5mb1sx
+XTsgdXNlcl9mb2xkZXIgPSBnZXRfdXNlcl9mb2xkZXIoc2NyaXB0X293bmVy
+X2lkKQogICAgICAgIGZpbGVfcGF0aCA9IG9zLnBhdGguam9pbih1c2VyX2Zv
+bGRlciwgZmlsZV9uYW1lKTsgc2NyaXB0X2tleSA9IGYie3NjcmlwdF9vd25l
+cl9pZH1fe2ZpbGVfbmFtZX0iCgogICAgICAgIGlmIG5vdCBvcy5wYXRoLmV4
+aXN0cyhmaWxlX3BhdGgpOgogICAgICAgICAgICBib3QuYW5zd2VyX2NhbGxi
+YWNrX3F1ZXJ5KGNhbGwuaWQsIGYi4pqg77iPIEVycm9yOiBGaWxlIGB7Zmls
+ZV9uYW1lfWAgbWlzc2luZyEgUmUtdXBsb2FkLiIsIHNob3dfYWxlcnQ9VHJ1
+ZSkKICAgICAgICAgICAgcmVtb3ZlX3VzZXJfZmlsZV9kYihzY3JpcHRfb3du
+ZXJfaWQsIGZpbGVfbmFtZSkKICAgICAgICAgICAgaWYgc2NyaXB0X2tleSBp
+biBib3Rfc2NyaXB0czogZGVsIGJvdF9zY3JpcHRzW3NjcmlwdF9rZXldCiAg
+ICAgICAgICAgIGNoZWNrX2ZpbGVzX2NhbGxiYWNrKGNhbGwpOyByZXR1cm4K
+CiAgICAgICAgYm90LmFuc3dlcl9jYWxsYmFja19xdWVyeShjYWxsLmlkLCBm
+IuKPsyBSZXN0YXJ0aW5nIHtmaWxlX25hbWV9IGZvciB1c2VyIHtzY3JpcHRf
+b3duZXJfaWR9Li4uIikKICAgICAgICBpZiBpc19ib3RfcnVubmluZyhzY3Jp
+cHRfb3duZXJfaWQsIGZpbGVfbmFtZSk6CiAgICAgICAgICAgIGxvZ2dlci5p
+bmZvKGYiUmVzdGFydDogU3RvcHBpbmcgZXhpc3Rpbmcge3NjcmlwdF9rZXl9
+Li4uIikKICAgICAgICAgICAgcHJvY2Vzc19pbmZvID0gYm90X3NjcmlwdHMu
+Z2V0KHNjcmlwdF9rZXkpCiAgICAgICAgICAgIGlmIHByb2Nlc3NfaW5mbzog
+a2lsbF9wcm9jZXNzX3RyZWUocHJvY2Vzc19pbmZvKQogICAgICAgICAgICBp
+ZiBzY3JpcHRfa2V5IGluIGJvdF9zY3JpcHRzOiBkZWwgYm90X3NjcmlwdHNb
+c2NyaXB0X2tleV0KICAgICAgICAgICAgdGltZS5zbGVlcCgxLjUpIAoKICAg
+ICAgICBsb2dnZXIuaW5mbyhmIlJlc3RhcnQ6IFN0YXJ0aW5nIHNjcmlwdCB7
+c2NyaXB0X2tleX0uLi4iKQogICAgICAgIGlmIGZpbGVfdHlwZSA9PSAncHkn
+OgogICAgICAgICAgICB0aHJlYWRpbmcuVGhyZWFkKHRhcmdldD1ydW5fc2Ny
+aXB0LCBhcmdzPShmaWxlX3BhdGgsIHNjcmlwdF9vd25lcl9pZCwgdXNlcl9m
+b2xkZXIsIGZpbGVfbmFtZSwgY2FsbC5tZXNzYWdlKSkuc3RhcnQoKQogICAg
+ICAgIGVsaWYgZmlsZV90eXBlID09ICdqcyc6CiAgICAgICAgICAgIHRocmVh
+ZGluZy5UaHJlYWQodGFyZ2V0PXJ1bl9qc19zY3JpcHQsIGFyZ3M9KGZpbGVf
+cGF0aCwgc2NyaXB0X293bmVyX2lkLCB1c2VyX2ZvbGRlciwgZmlsZV9uYW1l
+LCBjYWxsLm1lc3NhZ2UpKS5zdGFydCgpCiAgICAgICAgZWxzZToKICAgICAg
+ICAgICAgIGJvdC5zZW5kX21lc3NhZ2UoY2hhdF9pZF9mb3JfcmVwbHksIGYi
+4p2MIFVua25vd24gdHlwZSAne2ZpbGVfdHlwZX0nIGZvciAne2ZpbGVfbmFt
+ZX0nLiIpOyByZXR1cm4KCiAgICAgICAgdGltZS5zbGVlcCgxLjUpIAogICAg
+ICAgIGlzX25vd19ydW5uaW5nID0gaXNfYm90X3J1bm5pbmcoc2NyaXB0X293
+bmVyX2lkLCBmaWxlX25hbWUpIAogICAgICAgIHN0YXR1c190ZXh0ID0gJ/Cf
+n6IgUnVubmluZycgaWYgaXNfbm93X3J1bm5pbmcgZWxzZSAn8J+foSBTdGFy
+dGluZyAob3IgZmFpbGVkKScKICAgICAgICB0cnk6CiAgICAgICAgICAgIGJv
+dC5lZGl0X21lc3NhZ2VfdGV4dCgKICAgICAgICAgICAgICAgIGYi4pqZ77iP
+IENvbnRyb2xzIGZvcjogYHtmaWxlX25hbWV9YCAoe2ZpbGVfdHlwZX0pIG9m
+IFVzZXIgYHtzY3JpcHRfb3duZXJfaWR9YFxuU3RhdHVzOiB7c3RhdHVzX3Rl
+eHR9IiwKICAgICAgICAgICAgICAgIGNoYXRfaWRfZm9yX3JlcGx5LCBjYWxs
+Lm1lc3NhZ2UubWVzc2FnZV9pZCwKICAgICAgICAgICAgICAgIHJlcGx5X21h
+cmt1cD1jcmVhdGVfY29udHJvbF9idXR0b25zKHNjcmlwdF9vd25lcl9pZCwg
+ZmlsZV9uYW1lLCBpc19ub3dfcnVubmluZyksIHBhcnNlX21vZGU9J01hcmtk
+b3duJwogICAgICAgICAgICApCiAgICAgICAgZXhjZXB0IHRlbGVib3QuYXBp
+aGVscGVyLkFwaVRlbGVncmFtRXhjZXB0aW9uIGFzIGU6CiAgICAgICAgICAg
+ICBpZiAibWVzc2FnZSBpcyBub3QgbW9kaWZpZWQiIGluIHN0cihlKTogbG9n
+Z2VyLndhcm5pbmcoZiJNc2cgbm90IG1vZGlmaWVkIChyZXN0YXJ0IHtmaWxl
+X25hbWV9KSIpCiAgICAgICAgICAgICBlbHNlOiByYWlzZQogICAgZXhjZXB0
+IChWYWx1ZUVycm9yLCBJbmRleEVycm9yKSBhcyBlOgogICAgICAgIGxvZ2dl
+ci5lcnJvcihmIkVycm9yIHBhcnNpbmcgcmVzdGFydCBjYWxsYmFjayAne2Nh
+bGwuZGF0YX0nOiB7ZX0iKQogICAgICAgIGJvdC5hbnN3ZXJfY2FsbGJhY2tf
+cXVlcnkoY2FsbC5pZCwgIkVycm9yOiBJbnZhbGlkIHJlc3RhcnQgY29tbWFu
+ZC4iLCBzaG93X2FsZXJ0PVRydWUpCiAgICBleGNlcHQgRXhjZXB0aW9uIGFz
+IGU6CiAgICAgICAgbG9nZ2VyLmVycm9yKGYiRXJyb3IgaW4gcmVzdGFydF9i
+b3RfY2FsbGJhY2sgZm9yICd7Y2FsbC5kYXRhfSc6IHtlfSIsIGV4Y19pbmZv
+PVRydWUpCiAgICAgICAgYm90LmFuc3dlcl9jYWxsYmFja19xdWVyeShjYWxs
+LmlkLCAiRXJyb3IgcmVzdGFydGluZy4iLCBzaG93X2FsZXJ0PVRydWUpCiAg
+ICAgICAgdHJ5OgogICAgICAgICAgICBfLCBzY3JpcHRfb3duZXJfaWRfZXJy
+X3N0ciwgZmlsZV9uYW1lX2VyciA9IGNhbGwuZGF0YS5zcGxpdCgnXycsIDIp
+CiAgICAgICAgICAgIHNjcmlwdF9vd25lcl9pZF9lcnIgPSBpbnQoc2NyaXB0
+X293bmVyX2lkX2Vycl9zdHIpCiAgICAgICAgICAgIGJvdC5lZGl0X21lc3Nh
+Z2VfcmVwbHlfbWFya3VwKGNhbGwubWVzc2FnZS5jaGF0LmlkLCBjYWxsLm1l
+c3NhZ2UubWVzc2FnZV9pZCwgcmVwbHlfbWFya3VwPWNyZWF0ZV9jb250cm9s
+X2J1dHRvbnMoc2NyaXB0X293bmVyX2lkX2VyciwgZmlsZV9uYW1lX2Vyciwg
+RmFsc2UpKQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZV9idG46IGxv
+Z2dlci5lcnJvcihmIkZhaWxlZCB0byB1cGRhdGUgYnV0dG9ucyBhZnRlciBy
+ZXN0YXJ0IGVycm9yOiB7ZV9idG59IikKCgpkZWYgZGVsZXRlX2JvdF9jYWxs
+YmFjayhjYWxsKToKICAgIHRyeToKICAgICAgICBfLCBzY3JpcHRfb3duZXJf
+aWRfc3RyLCBmaWxlX25hbWUgPSBjYWxsLmRhdGEuc3BsaXQoJ18nLCAyKQog
+ICAgICAgIHNjcmlwdF9vd25lcl9pZCA9IGludChzY3JpcHRfb3duZXJfaWRf
+c3RyKQogICAgICAgIHJlcXVlc3RpbmdfdXNlcl9pZCA9IGNhbGwuZnJvbV91
+c2VyLmlkCiAgICAgICAgY2hhdF9pZF9mb3JfcmVwbHkgPSBjYWxsLm1lc3Nh
+Z2UuY2hhdC5pZAoKICAgICAgICBsb2dnZXIuaW5mbyhmIkRlbGV0ZTogUmVx
+dWVzdGVyPXtyZXF1ZXN0aW5nX3VzZXJfaWR9LCBPd25lcj17c2NyaXB0X293
+bmVyX2lkfSwgRmlsZT0ne2ZpbGVfbmFtZX0nIikKICAgICAgICBpZiBub3Qg
+KHJlcXVlc3RpbmdfdXNlcl9pZCA9PSBzY3JpcHRfb3duZXJfaWQgb3IgcmVx
+dWVzdGluZ191c2VyX2lkIGluIGFkbWluX2lkcyk6CiAgICAgICAgICAgIGJv
+dC5hbnN3ZXJfY2FsbGJhY2tfcXVlcnkoY2FsbC5pZCwgIuKaoO+4jyBQZXJt
+aXNzaW9uIGRlbmllZC4iLCBzaG93X2FsZXJ0PVRydWUpOyByZXR1cm4KCiAg
+ICAgICAgdXNlcl9maWxlc19saXN0ID0gdXNlcl9maWxlcy5nZXQoc2NyaXB0
+X293bmVyX2lkLCBbXSkKICAgICAgICBpZiBub3QgYW55KGZbMF0gPT0gZmls
+ZV9uYW1lIGZvciBmIGluIHVzZXJfZmlsZXNfbGlzdCk6CiAgICAgICAgICAg
+IGJvdC5hbnN3ZXJfY2FsbGJhY2tfcXVlcnkoY2FsbC5pZCwgIuKaoO+4jyBG
+aWxlIG5vdCBmb3VuZC4iLCBzaG93X2FsZXJ0PVRydWUpOyBjaGVja19maWxl
+c19jYWxsYmFjayhjYWxsKTsgcmV0dXJuCgogICAgICAgIGJvdC5hbnN3ZXJf
+Y2FsbGJhY2tfcXVlcnkoY2FsbC5pZCwgZiLwn5eR77iPIERlbGV0aW5nIHtm
+aWxlX25hbWV9IGZvciB1c2VyIHtzY3JpcHRfb3duZXJfaWR9Li4uIikKICAg
+ICAgICBzY3JpcHRfa2V5ID0gZiJ7c2NyaXB0X293bmVyX2lkfV97ZmlsZV9u
+YW1lfSIKICAgICAgICBpZiBpc19ib3RfcnVubmluZyhzY3JpcHRfb3duZXJf
+aWQsIGZpbGVfbmFtZSk6CiAgICAgICAgICAgIGxvZ2dlci5pbmZvKGYiRGVs
+ZXRlOiBTdG9wcGluZyB7c2NyaXB0X2tleX0uLi4iKQogICAgICAgICAgICBw
+cm9jZXNzX2luZm8gPSBib3Rfc2NyaXB0cy5nZXQoc2NyaXB0X2tleSkKICAg
+ICAgICAgICAgaWYgcHJvY2Vzc19pbmZvOiBraWxsX3Byb2Nlc3NfdHJlZShw
+cm9jZXNzX2luZm8pCiAgICAgICAgICAgIGlmIHNjcmlwdF9rZXkgaW4gYm90
+X3NjcmlwdHM6IGRlbCBib3Rfc2NyaXB0c1tzY3JpcHRfa2V5XQogICAgICAg
+ICAgICB0aW1lLnNsZWVwKDAuNSkgCgogICAgICAgIHVzZXJfZm9sZGVyID0g
+Z2V0X3VzZXJfZm9sZGVyKHNjcmlwdF9vd25lcl9pZCkKICAgICAgICBmaWxl
+X3BhdGggPSBvcy5wYXRoLmpvaW4odXNlcl9mb2xkZXIsIGZpbGVfbmFtZSkK
+ICAgICAgICBsb2dfcGF0aCA9IG9zLnBhdGguam9pbih1c2VyX2ZvbGRlciwg
+ZiJ7b3MucGF0aC5zcGxpdGV4dChmaWxlX25hbWUpWzBdfS5sb2ciKQogICAg
+ICAgIGRlbGV0ZWRfZGlzayA9IFtdCiAgICAgICAgaWYgb3MucGF0aC5leGlz
+dHMoZmlsZV9wYXRoKToKICAgICAgICAgICAgdHJ5OiBvcy5yZW1vdmUoZmls
+ZV9wYXRoKTsgZGVsZXRlZF9kaXNrLmFwcGVuZChmaWxlX25hbWUpOyBsb2dn
+ZXIuaW5mbyhmIkRlbGV0ZWQgZmlsZToge2ZpbGVfcGF0aH0iKQogICAgICAg
+ICAgICBleGNlcHQgT1NFcnJvciBhcyBlOiBsb2dnZXIuZXJyb3IoZiJFcnJv
+ciBkZWxldGluZyB7ZmlsZV9wYXRofToge2V9IikKICAgICAgICBpZiBvcy5w
+YXRoLmV4aXN0cyhsb2dfcGF0aCk6CiAgICAgICAgICAgIHRyeTogb3MucmVt
+b3ZlKGxvZ19wYXRoKTsgZGVsZXRlZF9kaXNrLmFwcGVuZChvcy5wYXRoLmJh
+c2VuYW1lKGxvZ19wYXRoKSk7IGxvZ2dlci5pbmZvKGYiRGVsZXRlZCBsb2c6
+IHtsb2dfcGF0aH0iKQogICAgICAgICAgICBleGNlcHQgT1NFcnJvciBhcyBl
+OiBsb2dnZXIuZXJyb3IoZiJFcnJvciBkZWxldGluZyBsb2cge2xvZ19wYXRo
+fToge2V9IikKCiAgICAgICAgcmVtb3ZlX3VzZXJfZmlsZV9kYihzY3JpcHRf
+b3duZXJfaWQsIGZpbGVfbmFtZSkKICAgICAgICBkZWxldGVkX3N0ciA9ICIs
+ICIuam9pbihmImB7Zn1gIiBmb3IgZiBpbiBkZWxldGVkX2Rpc2spIGlmIGRl
+bGV0ZWRfZGlzayBlbHNlICJhc3NvY2lhdGVkIGZpbGVzIgogICAgICAgIHRy
+eToKICAgICAgICAgICAgYm90LmVkaXRfbWVzc2FnZV90ZXh0KAogICAgICAg
+ICAgICAgICAgZiLwn5eR77iPIFJlY29yZCBge2ZpbGVfbmFtZX1gIChVc2Vy
+IGB7c2NyaXB0X293bmVyX2lkfWApIGFuZCB7ZGVsZXRlZF9zdHJ9IGRlbGV0
+ZWQhIiwKICAgICAgICAgICAgICAgIGNoYXRfaWRfZm9yX3JlcGx5LCBjYWxs
+Lm1lc3NhZ2UubWVzc2FnZV9pZCwgcmVwbHlfbWFya3VwPU5vbmUsIHBhcnNl
+X21vZGU9J01hcmtkb3duJwogICAgICAgICAgICApCiAgICAgICAgZXhjZXB0
+IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgICAgICBsb2dnZXIuZXJyb3IoZiJF
+cnJvciBlZGl0aW5nIG1zZyBhZnRlciBkZWxldGU6IHtlfSIpCiAgICAgICAg
+ICAgIGJvdC5zZW5kX21lc3NhZ2UoY2hhdF9pZF9mb3JfcmVwbHksIGYi8J+X
+ke+4jyBSZWNvcmQgYHtmaWxlX25hbWV9YCBkZWxldGVkLiIsIHBhcnNlX21v
+ZGU9J01hcmtkb3duJykKICAgIGV4Y2VwdCAoVmFsdWVFcnJvciwgSW5kZXhF
+cnJvcikgYXMgZToKICAgICAgICBsb2dnZXIuZXJyb3IoZiJFcnJvciBwYXJz
+aW5nIGRlbGV0ZSBjYWxsYmFjayAne2NhbGwuZGF0YX0nOiB7ZX0iKQogICAg
+ICAgIGJvdC5hbnN3ZXJfY2FsbGJhY2tfcXVlcnkoY2FsbC5pZCwgIkVycm9y
+OiBJbnZhbGlkIGRlbGV0ZSBjb21tYW5kLiIsIHNob3dfYWxlcnQ9VHJ1ZSkK
+ICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICBsb2dnZXIuZXJy
+b3IoZiJFcnJvciBpbiBkZWxldGVfYm90X2NhbGxiYWNrIGZvciAne2NhbGwu
+ZGF0YX0nOiB7ZX0iLCBleGNfaW5mbz1UcnVlKQogICAgICAgIGJvdC5hbnN3
+ZXJfY2FsbGJhY2tfcXVlcnkoY2FsbC5pZCwgIkVycm9yIGRlbGV0aW5nLiIs
+IHNob3dfYWxlcnQ9VHJ1ZSkKCmRlZiBsb2dzX2JvdF9jYWxsYmFjayhjYWxs
+KToKICAgIHRyeToKICAgICAgICBfLCBzY3JpcHRfb3duZXJfaWRfc3RyLCBm
+aWxlX25hbWUgPSBjYWxsLmRhdGEuc3BsaXQoJ18nLCAyKQogICAgICAgIHNj
+cmlwdF9vd25lcl9pZCA9IGludChzY3JpcHRfb3duZXJfaWRfc3RyKQogICAg
+ICAgIHJlcXVlc3RpbmdfdXNlcl9pZCA9IGNhbGwuZnJvbV91c2VyLmlkCiAg
+ICAgICAgY2hhdF9pZF9mb3JfcmVwbHkgPSBjYWxsLm1lc3NhZ2UuY2hhdC5p
+ZAoKICAgICAgICBsb2dnZXIuaW5mbyhmIkxvZ3M6IFJlcXVlc3Rlcj17cmVx
+dWVzdGluZ191c2VyX2lkfSwgT3duZXI9e3NjcmlwdF9vd25lcl9pZH0sIEZp
+bGU9J3tmaWxlX25hbWV9JyIpCiAgICAgICAgaWYgbm90IChyZXF1ZXN0aW5n
+X3VzZXJfaWQgPT0gc2NyaXB0X293bmVyX2lkIG9yIHJlcXVlc3RpbmdfdXNl
+cl9pZCBpbiBhZG1pbl9pZHMpOgogICAgICAgICAgICBib3QuYW5zd2VyX2Nh
+bGxiYWNrX3F1ZXJ5KGNhbGwuaWQsICLimqDvuI8gUGVybWlzc2lvbiBkZW5p
+ZWQuIiwgc2hvd19hbGVydD1UcnVlKTsgcmV0dXJuCgogICAgICAgIHVzZXJf
+ZmlsZXNfbGlzdCA9IHVzZXJfZmlsZXMuZ2V0KHNjcmlwdF9vd25lcl9pZCwg
+W10pCiAgICAgICAgaWYgbm90IGFueShmWzBdID09IGZpbGVfbmFtZSBmb3Ig
+ZiBpbiB1c2VyX2ZpbGVzX2xpc3QpOgogICAgICAgICAgICBib3QuYW5zd2Vy
+X2NhbGxiYWNrX3F1ZXJ5KGNhbGwuaWQsICLimqDvuI8gRmlsZSBub3QgZm91
+bmQuIiwgc2hvd19hbGVydD1UcnVlKTsgY2hlY2tfZmlsZXNfY2FsbGJhY2so
+Y2FsbCk7IHJldHVybgoKICAgICAgICB1c2VyX2ZvbGRlciA9IGdldF91c2Vy
+X2ZvbGRlcihzY3JpcHRfb3duZXJfaWQpCiAgICAgICAgbG9nX3BhdGggPSBv
+cy5wYXRoLmpvaW4odXNlcl9mb2xkZXIsIGYie29zLnBhdGguc3BsaXRleHQo
+ZmlsZV9uYW1lKVswXX0ubG9nIikKICAgICAgICBpZiBub3Qgb3MucGF0aC5l
+eGlzdHMobG9nX3BhdGgpOgogICAgICAgICAgICBib3QuYW5zd2VyX2NhbGxi
+YWNrX3F1ZXJ5KGNhbGwuaWQsIGYi4pqg77iPIE5vIGxvZ3MgZm9yICd7Zmls
+ZV9uYW1lfScuIiwgc2hvd19hbGVydD1UcnVlKTsgcmV0dXJuCgogICAgICAg
+IGJvdC5hbnN3ZXJfY2FsbGJhY2tfcXVlcnkoY2FsbC5pZCkgCiAgICAgICAg
+dHJ5OgogICAgICAgICAgICBsb2dfY29udGVudCA9ICIiOyBmaWxlX3NpemUg
+PSBvcy5wYXRoLmdldHNpemUobG9nX3BhdGgpCiAgICAgICAgICAgIG1heF9s
+b2dfa2IgPSAxMDA7IG1heF90Z19tc2cgPSA0MDk2CiAgICAgICAgICAgIGlm
+IGZpbGVfc2l6ZSA9PSAwOiBsb2dfY29udGVudCA9ICIoTG9nIGVtcHR5KSIK
+ICAgICAgICAgICAgZWxpZiBmaWxlX3NpemUgPiBtYXhfbG9nX2tiICogMTAy
+NDoKICAgICAgICAgICAgICAgICB3aXRoIG9wZW4obG9nX3BhdGgsICdyYicp
+IGFzIGY6IGYuc2VlaygtbWF4X2xvZ19rYiAqIDEwMjQsIG9zLlNFRUtfRU5E
+KTsgbG9nX2J5dGVzID0gZi5yZWFkKCkKICAgICAgICAgICAgICAgICBsb2df
+Y29udGVudCA9IGxvZ19ieXRlcy5kZWNvZGUoJ3V0Zi04JywgZXJyb3JzPSdp
+Z25vcmUnKQogICAgICAgICAgICAgICAgIGxvZ19jb250ZW50ID0gZiIoTGFz
+dCB7bWF4X2xvZ19rYn0gS0IpXG4uLi5cbiIgKyBsb2dfY29udGVudAogICAg
+ICAgICAgICBlbHNlOgogICAgICAgICAgICAgICAgIHdpdGggb3Blbihsb2df
+cGF0aCwgJ3InLCBlbmNvZGluZz0ndXRmLTgnLCBlcnJvcnM9J2lnbm9yZScp
+IGFzIGY6IGxvZ19jb250ZW50ID0gZi5yZWFkKCkKCiAgICAgICAgICAgIGlm
+IGxlbihsb2dfY29udGVudCkgPiBtYXhfdGdfbXNnOgogICAgICAgICAgICAg
+ICAgbG9nX2NvbnRlbnQgPSBsb2dfY29udGVudFstbWF4X3RnX21zZzpdCiAg
+ICAgICAgICAgICAgICBmaXJzdF9ubCA9IGxvZ19jb250ZW50LmZpbmQoJ1xu
+JykKICAgICAgICAgICAgICAgIGlmIGZpcnN0X25sICE9IC0xOiBsb2dfY29u
+dGVudCA9ICIuLi5cbiIgKyBsb2dfY29udGVudFtmaXJzdF9ubCsxOl0KICAg
+ICAgICAgICAgICAgIGVsc2U6IGxvZ19jb250ZW50ID0gIi4uLlxuIiArIGxv
+Z19jb250ZW50IAogICAgICAgICAgICBpZiBub3QgbG9nX2NvbnRlbnQuc3Ry
+aXAoKTogbG9nX2NvbnRlbnQgPSAiKE5vIHZpc2libGUgY29udGVudCkiCgog
+ICAgICAgICAgICBib3Quc2VuZF9tZXNzYWdlKGNoYXRfaWRfZm9yX3JlcGx5
+LCBmIvCfk5wgTG9ncyBmb3IgYHtmaWxlX25hbWV9YCAoVXNlciBge3Njcmlw
+dF9vd25lcl9pZH1gKTpcbmBgYFxue2xvZ19jb250ZW50fVxuYGBgIiwgcGFy
+c2VfbW9kZT0nTWFya2Rvd24nKQogICAgICAgIGV4Y2VwdCBFeGNlcHRpb24g
+YXMgZToKICAgICAgICAgICAgbG9nZ2VyLmVycm9yKGYiRXJyb3IgcmVhZGlu
+Zy9zZW5kaW5nIGxvZyB7bG9nX3BhdGh9OiB7ZX0iLCBleGNfaW5mbz1UcnVl
+KQogICAgICAgICAgICBib3Quc2VuZF9tZXNzYWdlKGNoYXRfaWRfZm9yX3Jl
+cGx5LCBmIuKdjCBFcnJvciByZWFkaW5nIGxvZyBmb3IgYHtmaWxlX25hbWV9
+YC4iKQogICAgZXhjZXB0IChWYWx1ZUVycm9yLCBJbmRleEVycm9yKSBhcyBl
+OgogICAgICAgIGxvZ2dlci5lcnJvcihmIkVycm9yIHBhcnNpbmcgbG9ncyBj
+YWxsYmFjayAne2NhbGwuZGF0YX0nOiB7ZX0iKQogICAgICAgIGJvdC5hbnN3
+ZXJfY2FsbGJhY2tfcXVlcnkoY2FsbC5pZCwgIkVycm9yOiBJbnZhbGlkIGxv
+Z3MgY29tbWFuZC4iLCBzaG93X2FsZXJ0PVRydWUpCiAgICBleGNlcHQgRXhj
+ZXB0aW9uIGFzIGU6CiAgICAgICAgbG9nZ2VyLmVycm9yKGYiRXJyb3IgaW4g
+bG9nc19ib3RfY2FsbGJhY2sgZm9yICd7Y2FsbC5kYXRhfSc6IHtlfSIsIGV4
+Y19pbmZvPVRydWUpCiAgICAgICAgYm90LmFuc3dlcl9jYWxsYmFja19xdWVy
+eShjYWxsLmlkLCAiRXJyb3IgZmV0Y2hpbmcgbG9ncy4iLCBzaG93X2FsZXJ0
+PVRydWUpCgpkZWYgc3BlZWRfY2FsbGJhY2soY2FsbCk6CiAgICB1c2VyX2lk
+ID0gY2FsbC5mcm9tX3VzZXIuaWQKICAgIGNoYXRfaWQgPSBjYWxsLm1lc3Nh
+Z2UuY2hhdC5pZAogICAgc3RhcnRfY2JfcGluZ190aW1lID0gdGltZS50aW1l
+KCkgCiAgICB0cnk6CiAgICAgICAgYm90LmVkaXRfbWVzc2FnZV90ZXh0KCLw
+n4+DIFRlc3Rpbmcgc3BlZWQuLi4iLCBjaGF0X2lkLCBjYWxsLm1lc3NhZ2Uu
+bWVzc2FnZV9pZCkKICAgICAgICBib3Quc2VuZF9jaGF0X2FjdGlvbihjaGF0
+X2lkLCAndHlwaW5nJykgCiAgICAgICAgcmVzcG9uc2VfdGltZSA9IHJvdW5k
+KCh0aW1lLnRpbWUoKSAtIHN0YXJ0X2NiX3BpbmdfdGltZSkgKiAxMDAwLCAy
+KQogICAgICAgIHN0YXR1cyA9ICLwn5STIFVubG9ja2VkIiBpZiBub3QgYm90
+X2xvY2tlZCBlbHNlICLwn5SSIExvY2tlZCIKICAgICAgICAjIG1vZGUgPSAi
+8J+SsCBGcmVlIE1vZGU6IE9OIiBpZiBmcmVlX21vZGUgZWxzZSAi8J+SuCBG
+cmVlIE1vZGU6IE9GRiIgIyBSZW1vdmVkCiAgICAgICAgaWYgdXNlcl9pZCA9
+PSBPV05FUl9JRDogdXNlcl9sZXZlbCA9ICLwn5GRIE93bmVyIgogICAgICAg
+IGVsaWYgdXNlcl9pZCBpbiBhZG1pbl9pZHM6IHVzZXJfbGV2ZWwgPSAi8J+b
+oe+4jyBBZG1pbiIKICAgICAgICBlbGlmIHVzZXJfaWQgaW4gdXNlcl9zdWJz
+Y3JpcHRpb25zIGFuZCB1c2VyX3N1YnNjcmlwdGlvbnNbdXNlcl9pZF0uZ2V0
+KCdleHBpcnknLCBkYXRldGltZS5taW4pID4gZGF0ZXRpbWUubm93KCk6IHVz
+ZXJfbGV2ZWwgPSAi4q2QIFByZW1pdW0iCiAgICAgICAgZWxzZTogdXNlcl9s
+ZXZlbCA9ICLwn4aTIEZyZWUgVXNlciIKICAgICAgICBzcGVlZF9tc2cgPSAo
+ZiLimqEgQm90IFNwZWVkICYgU3RhdHVzOlxuXG7ij7HvuI8gQVBJIFJlc3Bv
+bnNlIFRpbWU6IHtyZXNwb25zZV90aW1lfSBtc1xuIgogICAgICAgICAgICAg
+ICAgICAgICBmIvCfmqYgQm90IFN0YXR1czoge3N0YXR1c31cbiIKICAgICAg
+ICAgICAgICAgICAgICAgIyBmIuaooeW8jyBNb2RlOiB7bW9kZX1cbiIgIyBS
+ZW1vdmVkCiAgICAgICAgICAgICAgICAgICAgIGYi8J+RpCBZb3VyIExldmVs
+OiB7dXNlcl9sZXZlbH0iKQogICAgICAgIGJvdC5hbnN3ZXJfY2FsbGJhY2tf
+cXVlcnkoY2FsbC5pZCkgCiAgICAgICAgYm90LmVkaXRfbWVzc2FnZV90ZXh0
+KHNwZWVkX21zZywgY2hhdF9pZCwgY2FsbC5tZXNzYWdlLm1lc3NhZ2VfaWQs
+IHJlcGx5X21hcmt1cD1jcmVhdGVfbWFpbl9tZW51X2lubGluZSh1c2VyX2lk
+KSkKICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZToKICAgICAgICAgbG9nZ2Vy
+LmVycm9yKGYiRXJyb3IgZHVyaW5nIHNwZWVkIHRlc3QgKGNiKToge2V9Iiwg
+ZXhjX2luZm89VHJ1ZSkKICAgICAgICAgYm90LmFuc3dlcl9jYWxsYmFja19x
+dWVyeShjYWxsLmlkLCAiRXJyb3IgaW4gc3BlZWQgdGVzdC4iLCBzaG93X2Fs
+ZXJ0PVRydWUpCiAgICAgICAgIHRyeTogYm90LmVkaXRfbWVzc2FnZV90ZXh0
+KCLjgL3vuI8gTWFpbiBNZW51IiwgY2hhdF9pZCwgY2FsbC5tZXNzYWdlLm1l
+c3NhZ2VfaWQsIHJlcGx5X21hcmt1cD1jcmVhdGVfbWFpbl9tZW51X2lubGlu
+ZSh1c2VyX2lkKSkKICAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbjogcGFzcwoK
+ZGVmIGJhY2tfdG9fbWFpbl9jYWxsYmFjayhjYWxsKToKICAgIHVzZXJfaWQg
+PSBjYWxsLmZyb21fdXNlci5pZAogICAgY2hhdF9pZCA9IGNhbGwubWVzc2Fn
+ZS5jaGF0LmlkCiAgICBmaWxlX2xpbWl0ID0gZ2V0X3VzZXJfZmlsZV9saW1p
+dCh1c2VyX2lkKQogICAgY3VycmVudF9maWxlcyA9IGdldF91c2VyX2ZpbGVf
+Y291bnQodXNlcl9pZCkKICAgIGxpbWl0X3N0ciA9IHN0cihmaWxlX2xpbWl0
+KSBpZiBmaWxlX2xpbWl0ICE9IGZsb2F0KCdpbmYnKSBlbHNlICJVbmxpbWl0
+ZWQiCiAgICBleHBpcnlfaW5mbyA9ICIiCiAgICBpZiB1c2VyX2lkID09IE9X
+TkVSX0lEOiB1c2VyX3N0YXR1cyA9ICLwn5GRIE93bmVyIgogICAgZWxpZiB1
+c2VyX2lkIGluIGFkbWluX2lkczogdXNlcl9zdGF0dXMgPSAi8J+boe+4jyBB
+ZG1pbiIKICAgIGVsaWYgdXNlcl9pZCBpbiB1c2VyX3N1YnNjcmlwdGlvbnM6
+CiAgICAgICAgZXhwaXJ5X2RhdGUgPSB1c2VyX3N1YnNjcmlwdGlvbnNbdXNl
+cl9pZF0uZ2V0KCdleHBpcnknKQogICAgICAgIGlmIGV4cGlyeV9kYXRlIGFu
+ZCBleHBpcnlfZGF0ZSA+IGRhdGV0aW1lLm5vdygpOgogICAgICAgICAgICB1
+c2VyX3N0YXR1cyA9ICLirZAgUHJlbWl1bSI7IGRheXNfbGVmdCA9IChleHBp
+cnlfZGF0ZSAtIGRhdGV0aW1lLm5vdygpKS5kYXlzCiAgICAgICAgICAgIGV4
+cGlyeV9pbmZvID0gZiJcbuKPsyBTdWJzY3JpcHRpb24gZXhwaXJlcyBpbjog
+e2RheXNfbGVmdH0gZGF5cyIKICAgICAgICBlbHNlOiB1c2VyX3N0YXR1cyA9
+ICLwn4aTIEZyZWUgVXNlciAoRXhwaXJlZCBTdWIpIiAjIFdpbGwgYmUgY2xl
+YW5lZCB1cCBieSB3ZWxjb21lIGlmIG5vdCBhbHJlYWR5CiAgICBlbHNlOiB1
+c2VyX3N0YXR1cyA9ICLwn4aTIEZyZWUgVXNlciIKICAgIG1haW5fbWVudV90
+ZXh0ID0gKGYi44C977iPIFdlbGNvbWUgYmFjaywge2NhbGwuZnJvbV91c2Vy
+LmZpcnN0X25hbWV9IVxuXG7wn4aUIElEOiBge3VzZXJfaWR9YFxuIgogICAg
+ICAgICAgICAgICAgICAgICAgZiLwn5SwIFN0YXR1czoge3VzZXJfc3RhdHVz
+fXtleHBpcnlfaW5mb31cbvCfk4EgRmlsZXM6IHtjdXJyZW50X2ZpbGVzfSAv
+IHtsaW1pdF9zdHJ9XG5cbiIKICAgICAgICAgICAgICAgICAgICAgIGYi8J+R
+hyBVc2UgYnV0dG9ucyBvciB0eXBlIGNvbW1hbmRzLiIpCiAgICB0cnk6CiAg
+ICAgICAgYm90LmFuc3dlcl9jYWxsYmFja19xdWVyeShjYWxsLmlkKQogICAg
+ICAgIGJvdC5lZGl0X21lc3NhZ2VfdGV4dChtYWluX21lbnVfdGV4dCwgY2hh
+dF9pZCwgY2FsbC5tZXNzYWdlLm1lc3NhZ2VfaWQsCiAgICAgICAgICAgICAg
+ICAgICAgICAgICAgICAgIHJlcGx5X21hcmt1cD1jcmVhdGVfbWFpbl9tZW51
+X2lubGluZSh1c2VyX2lkKSwgcGFyc2VfbW9kZT0nTWFya2Rvd24nKQogICAg
+ZXhjZXB0IHRlbGVib3QuYXBpaGVscGVyLkFwaVRlbGVncmFtRXhjZXB0aW9u
+IGFzIGU6CiAgICAgICAgIGlmICJtZXNzYWdlIGlzIG5vdCBtb2RpZmllZCIg
+aW4gc3RyKGUpOiBsb2dnZXIud2FybmluZygiTXNnIG5vdCBtb2RpZmllZCAo
+YmFja190b19tYWluKS4iKQogICAgICAgICBlbHNlOiBsb2dnZXIuZXJyb3Io
+ZiJBUEkgZXJyb3Igb24gYmFja190b19tYWluOiB7ZX0iKQogICAgZXhjZXB0
+IEV4Y2VwdGlvbiBhcyBlOiBsb2dnZXIuZXJyb3IoZiJFcnJvciBoYW5kbGlu
+ZyBiYWNrX3RvX21haW46IHtlfSIsIGV4Y19pbmZvPVRydWUpCgojIC0tLSBB
+ZG1pbiBDYWxsYmFjayBJbXBsZW1lbnRhdGlvbnMgKGZvciBJbmxpbmUgQnV0
+dG9ucykgLS0tCmRlZiBzdWJzY3JpcHRpb25fbWFuYWdlbWVudF9jYWxsYmFj
+ayhjYWxsKToKICAgIGJvdC5hbnN3ZXJfY2FsbGJhY2tfcXVlcnkoY2FsbC5p
+ZCkKICAgIHRyeToKICAgICAgICBib3QuZWRpdF9tZXNzYWdlX3RleHQoIvCf
+krMgU3Vic2NyaXB0aW9uIE1hbmFnZW1lbnRcblNlbGVjdCBhY3Rpb246IiwK
+ICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgY2FsbC5tZXNzYWdlLmNo
+YXQuaWQsIGNhbGwubWVzc2FnZS5tZXNzYWdlX2lkLCByZXBseV9tYXJrdXA9
+Y3JlYXRlX3N1YnNjcmlwdGlvbl9tZW51KCkpCiAgICBleGNlcHQgRXhjZXB0
+aW9uIGFzIGU6IGxvZ2dlci5lcnJvcihmIkVycm9yIHNob3dpbmcgc3ViIG1l
+bnU6IHtlfSIpCgpkZWYgc3RhdHNfY2FsbGJhY2soY2FsbCk6ICMgQ2FsbGVk
+IGJ5IHVzZXIgYW5kIGFkbWluCiAgICBib3QuYW5zd2VyX2NhbGxiYWNrX3F1
+ZXJ5KGNhbGwuaWQpCiAgICAjIFRoZSBsb2dpYyBpcyBub3cgaW5zaWRlIF9s
+b2dpY19zdGF0aXN0aWNzIHdoaWNoIGRldGVybWluZXMgd2hhdCB0byBzaG93
+IGJhc2VkIG9uIHVzZXJfaWQKICAgICMgV2UgbmVlZCB0byBwYXNzIGEgbWVz
+c2FnZS1saWtlIG9iamVjdCB0byBfbG9naWNfc3RhdGlzdGljcwogICAgIyBG
+b3IgY2FsbGJhY2tzLCBjYWxsLm1lc3NhZ2UgY2FuIGJlIHVzZWQuCiAgICBf
+bG9naWNfc3RhdGlzdGljcyhjYWxsLm1lc3NhZ2UpIAogICAgIyBUbyB1cGRh
+dGUgdGhlIGlubGluZSBrZXlib2FyZCBhZnRlciBzaG93aW5nIHN0YXRzLCB3
+ZSBuZWVkIHRvIGVkaXQgdGhlIG1lc3NhZ2UKICAgIHRyeToKICAgICAgICBi
+b3QuZWRpdF9tZXNzYWdlX3JlcGx5X21hcmt1cChjYWxsLm1lc3NhZ2UuY2hh
+dC5pZCwgY2FsbC5tZXNzYWdlLm1lc3NhZ2VfaWQsCiAgICAgICAgICAgICAg
+ICAgICAgICAgICAgICAgICAgICAgICAgcmVwbHlfbWFya3VwPWNyZWF0ZV9t
+YWluX21lbnVfaW5saW5lKGNhbGwuZnJvbV91c2VyLmlkKSkKICAgIGV4Y2Vw
+dCBFeGNlcHRpb24gYXMgZToKICAgICAgICBsb2dnZXIuZXJyb3IoZiJFcnJv
+ciB1cGRhdGluZyBtZW51IGFmdGVyIHN0YXRzX2NhbGxiYWNrOiB7ZX0iKQoK
+CmRlZiBsb2NrX2JvdF9jYWxsYmFjayhjYWxsKToKICAgIGdsb2JhbCBib3Rf
+bG9ja2VkOyBib3RfbG9ja2VkID0gVHJ1ZQogICAgbG9nZ2VyLndhcm5pbmco
+ZiJCb3QgbG9ja2VkIGJ5IEFkbWluIHtjYWxsLmZyb21fdXNlci5pZH0iKQog
+ICAgYm90LmFuc3dlcl9jYWxsYmFja19xdWVyeShjYWxsLmlkLCAi8J+UkiBC
+b3QgbG9ja2VkLiIpCiAgICB0cnk6IGJvdC5lZGl0X21lc3NhZ2VfcmVwbHlf
+bWFya3VwKGNhbGwubWVzc2FnZS5jaGF0LmlkLCBjYWxsLm1lc3NhZ2UubWVz
+c2FnZV9pZCwgcmVwbHlfbWFya3VwPWNyZWF0ZV9tYWluX21lbnVfaW5saW5l
+KGNhbGwuZnJvbV91c2VyLmlkKSkKICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMg
+ZTogbG9nZ2VyLmVycm9yKGYiRXJyb3IgdXBkYXRpbmcgbWVudSAobG9jayk6
+IHtlfSIpCgpkZWYgdW5sb2NrX2JvdF9jYWxsYmFjayhjYWxsKToKICAgIGds
+b2JhbCBib3RfbG9ja2VkOyBib3RfbG9ja2VkID0gRmFsc2UKICAgIGxvZ2dl
+ci53YXJuaW5nKGYiQm90IHVubG9ja2VkIGJ5IEFkbWluIHtjYWxsLmZyb21f
+dXNlci5pZH0iKQogICAgYm90LmFuc3dlcl9jYWxsYmFja19xdWVyeShjYWxs
+LmlkLCAi8J+UkyBCb3QgdW5sb2NrZWQuIikKICAgIHRyeTogYm90LmVkaXRf
+bWVzc2FnZV9yZXBseV9tYXJrdXAoY2FsbC5tZXNzYWdlLmNoYXQuaWQsIGNh
+bGwubWVzc2FnZS5tZXNzYWdlX2lkLCByZXBseV9tYXJrdXA9Y3JlYXRlX21h
+aW5fbWVudV9pbmxpbmUoY2FsbC5mcm9tX3VzZXIuaWQpKQogICAgZXhjZXB0
+IEV4Y2VwdGlvbiBhcyBlOiBsb2dnZXIuZXJyb3IoZiJFcnJvciB1cGRhdGlu
+ZyBtZW51ICh1bmxvY2spOiB7ZX0iKQoKIyBkZWYgdG9nZ2xlX2ZyZWVfbW9k
+ZV9jYWxsYmFjayhjYWxsKTogIyBSZW1vdmVkCiMgICAgIHBhc3MKCmRlZiBy
+dW5fYWxsX3NjcmlwdHNfY2FsbGJhY2soY2FsbCk6ICMgQWRkZWQKICAgIF9s
+b2dpY19ydW5fYWxsX3NjcmlwdHMoY2FsbCkgIyBQYXNzIHRoZSBjYWxsIG9i
+amVjdAoKCmRlZiBicm9hZGNhc3RfaW5pdF9jYWxsYmFjayhjYWxsKToKICAg
+IGJvdC5hbnN3ZXJfY2FsbGJhY2tfcXVlcnkoY2FsbC5pZCkKICAgIG1zZyA9
+IGJvdC5zZW5kX21lc3NhZ2UoY2FsbC5tZXNzYWdlLmNoYXQuaWQsICLwn5Oi
+IFNlbmQgbWVzc2FnZSB0byBicm9hZGNhc3QuXG4vY2FuY2VsIHRvIGFib3J0
+LiIpCiAgICBib3QucmVnaXN0ZXJfbmV4dF9zdGVwX2hhbmRsZXIobXNnLCBw
+cm9jZXNzX2Jyb2FkY2FzdF9tZXNzYWdlKQoKZGVmIHByb2Nlc3NfYnJvYWRj
+YXN0X21lc3NhZ2UobWVzc2FnZSk6CiAgICB1c2VyX2lkID0gbWVzc2FnZS5m
+cm9tX3VzZXIuaWQKICAgIGlmIHVzZXJfaWQgbm90IGluIGFkbWluX2lkczog
+Ym90LnJlcGx5X3RvKG1lc3NhZ2UsICLimqDvuI8gTm90IGF1dGhvcml6ZWQu
+Iik7IHJldHVybgogICAgaWYgbWVzc2FnZS50ZXh0IGFuZCBtZXNzYWdlLnRl
+eHQubG93ZXIoKSA9PSAnL2NhbmNlbCc6IGJvdC5yZXBseV90byhtZXNzYWdl
+LCAiQnJvYWRjYXN0IGNhbmNlbGxlZC4iKTsgcmV0dXJuCgogICAgYnJvYWRj
+YXN0X2NvbnRlbnQgPSBtZXNzYWdlLnRleHQgIyBDYW4gYWxzbyBoYW5kbGUg
+cGhvdG9zLCB2aWRlb3MgZXRjLiBpZiBtZXNzYWdlLmNvbnRlbnRfdHlwZSBp
+cyBjaGVja2VkCiAgICBpZiBub3QgYnJvYWRjYXN0X2NvbnRlbnQgYW5kIG5v
+dCAobWVzc2FnZS5waG90byBvciBtZXNzYWdlLnZpZGVvIG9yIG1lc3NhZ2Uu
+ZG9jdW1lbnQgb3IgbWVzc2FnZS5zdGlja2VyIG9yIG1lc3NhZ2Uudm9pY2Ug
+b3IgbWVzc2FnZS5hdWRpbyk6ICMgSWYgbm8gdGV4dCBhbmQgbm8gb3RoZXIg
+bWVkaWEKICAgICAgICAgYm90LnJlcGx5X3RvKG1lc3NhZ2UsICLimqDvuI8g
+Q2Fubm90IGJyb2FkY2FzdCBlbXB0eSBtZXNzYWdlLiBTZW5kIHRleHQgb3Ig
+bWVkaWEsIG9yIC9jYW5jZWwuIikKICAgICAgICAgbXNnID0gYm90LnNlbmRf
+bWVzc2FnZShtZXNzYWdlLmNoYXQuaWQsICLwn5OiIFNlbmQgYnJvYWRjYXN0
+IG1lc3NhZ2Ugb3IgL2NhbmNlbC4iKQogICAgICAgICBib3QucmVnaXN0ZXJf
+bmV4dF9zdGVwX2hhbmRsZXIobXNnLCBwcm9jZXNzX2Jyb2FkY2FzdF9tZXNz
+YWdlKQogICAgICAgICByZXR1cm4KCiAgICB0YXJnZXRfY291bnQgPSBsZW4o
+YWN0aXZlX3VzZXJzKQogICAgbWFya3VwID0gdHlwZXMuSW5saW5lS2V5Ym9h
+cmRNYXJrdXAoKQogICAgbWFya3VwLnJvdyh0eXBlcy5JbmxpbmVLZXlib2Fy
+ZEJ1dHRvbigi4pyFIENvbmZpcm0gJiBTZW5kIiwgY2FsbGJhY2tfZGF0YT1m
+ImNvbmZpcm1fYnJvYWRjYXN0X3ttZXNzYWdlLm1lc3NhZ2VfaWR9IiksCiAg
+ICAgICAgICAgICAgIHR5cGVzLklubGluZUtleWJvYXJkQnV0dG9uKCLinYwg
+Q2FuY2VsIiwgY2FsbGJhY2tfZGF0YT0iY2FuY2VsX2Jyb2FkY2FzdCIpKQoK
+ICAgIHByZXZpZXdfdGV4dCA9IGJyb2FkY2FzdF9jb250ZW50WzoxMDAwXS5z
+dHJpcCgpIGlmIGJyb2FkY2FzdF9jb250ZW50IGVsc2UgIihNZWRpYSBtZXNz
+YWdlKSIKICAgIGJvdC5yZXBseV90byhtZXNzYWdlLCBmIuKaoO+4jyBDb25m
+aXJtIEJyb2FkY2FzdDpcblxuYGBgXG57cHJldmlld190ZXh0fVxuYGBgXG4i
+IAogICAgICAgICAgICAgICAgICAgICAgICAgIGYiVG8gKip7dGFyZ2V0X2Nv
+dW50fSoqIHVzZXJzLiBTdXJlPyIsIHJlcGx5X21hcmt1cD1tYXJrdXAsIHBh
+cnNlX21vZGU9J01hcmtkb3duJykKCmRlZiBoYW5kbGVfY29uZmlybV9icm9h
+ZGNhc3QoY2FsbCk6CiAgICB1c2VyX2lkID0gY2FsbC5mcm9tX3VzZXIuaWQK
+ICAgIGNoYXRfaWQgPSBjYWxsLm1lc3NhZ2UuY2hhdC5pZAogICAgaWYgdXNl
+cl9pZCBub3QgaW4gYWRtaW5faWRzOiBib3QuYW5zd2VyX2NhbGxiYWNrX3F1
+ZXJ5KGNhbGwuaWQsICLimqDvuI8gQWRtaW4gb25seS4iLCBzaG93X2FsZXJ0
+PVRydWUpOyByZXR1cm4KICAgIHRyeToKICAgICAgICBvcmlnaW5hbF9tZXNz
+YWdlID0gY2FsbC5tZXNzYWdlLnJlcGx5X3RvX21lc3NhZ2UKICAgICAgICBp
+ZiBub3Qgb3JpZ2luYWxfbWVzc2FnZTogcmFpc2UgVmFsdWVFcnJvcigiQ291
+bGQgbm90IHJldHJpZXZlIG9yaWdpbmFsIG1lc3NhZ2UuIikKCiAgICAgICAg
+IyBDaGVjayBjb250ZW50IHR5cGUgYW5kIGdldCBjb250ZW50CiAgICAgICAg
+YnJvYWRjYXN0X3RleHQgPSBOb25lCiAgICAgICAgYnJvYWRjYXN0X3Bob3Rv
+X2lkID0gTm9uZQogICAgICAgIGJyb2FkY2FzdF92aWRlb19pZCA9IE5vbmUK
+ICAgICAgICAjIEFkZCBvdGhlciB0eXBlcyBhcyBuZWVkZWQ6IGRvY3VtZW50
+LCBzdGlja2VyLCB2b2ljZSwgYXVkaW8KCiAgICAgICAgaWYgb3JpZ2luYWxf
+bWVzc2FnZS50ZXh0OgogICAgICAgICAgICBicm9hZGNhc3RfdGV4dCA9IG9y
+aWdpbmFsX21lc3NhZ2UudGV4dAogICAgICAgIGVsaWYgb3JpZ2luYWxfbWVz
+c2FnZS5waG90bzoKICAgICAgICAgICAgYnJvYWRjYXN0X3Bob3RvX2lkID0g
+b3JpZ2luYWxfbWVzc2FnZS5waG90b1stMV0uZmlsZV9pZCAjIEdldCBoaWdo
+ZXN0IHF1YWxpdHkKICAgICAgICBlbGlmIG9yaWdpbmFsX21lc3NhZ2Uudmlk
+ZW86CiAgICAgICAgICAgIGJyb2FkY2FzdF92aWRlb19pZCA9IG9yaWdpbmFs
+X21lc3NhZ2UudmlkZW8uZmlsZV9pZAogICAgICAgICMgQWRkIG1vcmUgZWxp
+ZiBmb3Igb3RoZXIgY29udGVudCB0eXBlcwogICAgICAgIGVsc2U6CiAgICAg
+ICAgICAgIHJhaXNlIFZhbHVlRXJyb3IoIk1lc3NhZ2UgaGFzIG5vIHRleHQg
+b3Igc3VwcG9ydGVkIG1lZGlhIGZvciBicm9hZGNhc3QuIikKCiAgICAgICAg
+Ym90LmFuc3dlcl9jYWxsYmFja19xdWVyeShjYWxsLmlkLCAi8J+agCBTdGFy
+dGluZyBicm9hZGNhc3QuLi4iKQogICAgICAgIGJvdC5lZGl0X21lc3NhZ2Vf
+dGV4dChmIvCfk6IgQnJvYWRjYXN0aW5nIHRvIHtsZW4oYWN0aXZlX3VzZXJz
+KX0gdXNlcnMuLi4iLAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICBj
+aGF0X2lkLCBjYWxsLm1lc3NhZ2UubWVzc2FnZV9pZCwgcmVwbHlfbWFya3Vw
+PU5vbmUpCiAgICAgICAgIyBQYXNzIGFsbCBwb3RlbnRpYWwgY29udGVudCB0
+eXBlcyB0byBleGVjdXRlX2Jyb2FkY2FzdAogICAgICAgIHRocmVhZCA9IHRo
+cmVhZGluZy5UaHJlYWQodGFyZ2V0PWV4ZWN1dGVfYnJvYWRjYXN0LCBhcmdz
+PSgKICAgICAgICAgICAgYnJvYWRjYXN0X3RleHQsIGJyb2FkY2FzdF9waG90
+b19pZCwgYnJvYWRjYXN0X3ZpZGVvX2lkLCAKICAgICAgICAgICAgb3JpZ2lu
+YWxfbWVzc2FnZS5jYXB0aW9uIGlmIChicm9hZGNhc3RfcGhvdG9faWQgb3Ig
+YnJvYWRjYXN0X3ZpZGVvX2lkKSBlbHNlIE5vbmUsICMgUGFzcyBjYXB0aW9u
+CiAgICAgICAgICAgIGNoYXRfaWQpKQogICAgICAgIHRocmVhZC5zdGFydCgp
+CiAgICBleGNlcHQgVmFsdWVFcnJvciBhcyB2ZTogCiAgICAgICAgbG9nZ2Vy
+LmVycm9yKGYiRXJyb3IgcmV0cmlldmluZyBtc2cgZm9yIGJyb2FkY2FzdCBj
+b25maXJtOiB7dmV9IikKICAgICAgICBib3QuZWRpdF9tZXNzYWdlX3RleHQo
+ZiLinYwgRXJyb3Igc3RhcnRpbmcgYnJvYWRjYXN0OiB7dmV9IiwgY2hhdF9p
+ZCwgY2FsbC5tZXNzYWdlLm1lc3NhZ2VfaWQsIHJlcGx5X21hcmt1cD1Ob25l
+KQogICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBlOgogICAgICAgIGxvZ2dlci5l
+cnJvcihmIkVycm9yIGluIGhhbmRsZV9jb25maXJtX2Jyb2FkY2FzdDoge2V9
+IiwgZXhjX2luZm89VHJ1ZSkKICAgICAgICBib3QuZWRpdF9tZXNzYWdlX3Rl
+eHQoIuKdjCBVbmV4cGVjdGVkIGVycm9yIGR1cmluZyBicm9hZGNhc3QgY29u
+ZmlybS4iLCBjaGF0X2lkLCBjYWxsLm1lc3NhZ2UubWVzc2FnZV9pZCwgcmVw
+bHlfbWFya3VwPU5vbmUpCgpkZWYgaGFuZGxlX2NhbmNlbF9icm9hZGNhc3Qo
+Y2FsbCk6CiAgICBib3QuYW5zd2VyX2NhbGxiYWNrX3F1ZXJ5KGNhbGwuaWQs
+ICJCcm9hZGNhc3QgY2FuY2VsbGVkLiIpCiAgICBib3QuZGVsZXRlX21lc3Nh
+Z2UoY2FsbC5tZXNzYWdlLmNoYXQuaWQsIGNhbGwubWVzc2FnZS5tZXNzYWdl
+X2lkKQogICAgIyBPcHRpb25hbGx5IGRlbGV0ZSB0aGUgb3JpZ2luYWwgbWVz
+c2FnZSB0b28gaWYgY2FsbC5tZXNzYWdlLnJlcGx5X3RvX21lc3NhZ2UgZXhp
+c3RzCiAgICBpZiBjYWxsLm1lc3NhZ2UucmVwbHlfdG9fbWVzc2FnZToKICAg
+ICAgICB0cnk6IGJvdC5kZWxldGVfbWVzc2FnZShjYWxsLm1lc3NhZ2UuY2hh
+dC5pZCwgY2FsbC5tZXNzYWdlLnJlcGx5X3RvX21lc3NhZ2UubWVzc2FnZV9p
+ZCkKICAgICAgICBleGNlcHQ6IHBhc3MKCgpkZWYgZXhlY3V0ZV9icm9hZGNh
+c3QoYnJvYWRjYXN0X3RleHQsIHBob3RvX2lkLCB2aWRlb19pZCwgY2FwdGlv
+biwgYWRtaW5fY2hhdF9pZCk6CiAgICBzZW50X2NvdW50ID0gMDsgZmFpbGVk
+X2NvdW50ID0gMDsgYmxvY2tlZF9jb3VudCA9IDAKICAgIHN0YXJ0X2V4ZWNf
+dGltZSA9IHRpbWUudGltZSgpIAogICAgdXNlcnNfdG9fYnJvYWRjYXN0ID0g
+bGlzdChhY3RpdmVfdXNlcnMpOyB0b3RhbF91c2VycyA9IGxlbih1c2Vyc190
+b19icm9hZGNhc3QpCiAgICBsb2dnZXIuaW5mbyhmIkV4ZWN1dGluZyBicm9h
+ZGNhc3QgdG8ge3RvdGFsX3VzZXJzfSB1c2Vycy4iKQogICAgYmF0Y2hfc2l6
+ZSA9IDI1OyBkZWxheV9iYXRjaGVzID0gMS41CgogICAgZm9yIGksIHVzZXJf
+aWRfYmMgaW4gZW51bWVyYXRlKHVzZXJzX3RvX2Jyb2FkY2FzdCk6ICMgUmVu
+YW1lZAogICAgICAgIHRyeToKICAgICAgICAgICAgaWYgYnJvYWRjYXN0X3Rl
+eHQ6CiAgICAgICAgICAgICAgICBib3Quc2VuZF9tZXNzYWdlKHVzZXJfaWRf
+YmMsIGJyb2FkY2FzdF90ZXh0LCBwYXJzZV9tb2RlPSdNYXJrZG93bicpCiAg
+ICAgICAgICAgIGVsaWYgcGhvdG9faWQ6CiAgICAgICAgICAgICAgICBib3Qu
+c2VuZF9waG90byh1c2VyX2lkX2JjLCBwaG90b19pZCwgY2FwdGlvbj1jYXB0
+aW9uLCBwYXJzZV9tb2RlPSdNYXJrZG93bicgaWYgY2FwdGlvbiBlbHNlIE5v
+bmUpCiAgICAgICAgICAgIGVsaWYgdmlkZW9faWQ6CiAgICAgICAgICAgICAg
+ICBib3Quc2VuZF92aWRlbyh1c2VyX2lkX2JjLCB2aWRlb19pZCwgY2FwdGlv
+bj1jYXB0aW9uLCBwYXJzZV9tb2RlPSdNYXJrZG93bicgaWYgY2FwdGlvbiBl
+bHNlIE5vbmUpCiAgICAgICAgICAgICMgQWRkIG90aGVyIHNlbmQgbWV0aG9k
+cyBmb3Igb3RoZXIgdHlwZXMKICAgICAgICAgICAgc2VudF9jb3VudCArPSAx
+CiAgICAgICAgZXhjZXB0IHRlbGVib3QuYXBpaGVscGVyLkFwaVRlbGVncmFt
+RXhjZXB0aW9uIGFzIGU6CiAgICAgICAgICAgIGVycl9kZXNjID0gc3RyKGUp
+Lmxvd2VyKCkKICAgICAgICAgICAgaWYgYW55KHMgaW4gZXJyX2Rlc2MgZm9y
+IHMgaW4gWyJib3Qgd2FzIGJsb2NrZWQiLCAidXNlciBpcyBkZWFjdGl2YXRl
+ZCIsICJjaGF0IG5vdCBmb3VuZCIsICJraWNrZWQgZnJvbSIsICJyZXN0cmlj
+dGVkIl0pOiAKICAgICAgICAgICAgICAgIGxvZ2dlci53YXJuaW5nKGYiQnJv
+YWRjYXN0IGZhaWxlZCB0byB7dXNlcl9pZF9iY306IFVzZXIgYmxvY2tlZC9p
+bmFjdGl2ZS4iKQogICAgICAgICAgICAgICAgYmxvY2tlZF9jb3VudCArPSAx
+CiAgICAgICAgICAgIGVsaWYgImZsb29kIGNvbnRyb2wiIGluIGVycl9kZXNj
+IG9yICJ0b28gbWFueSByZXF1ZXN0cyIgaW4gZXJyX2Rlc2M6CiAgICAgICAg
+ICAgICAgICByZXRyeV9hZnRlciA9IDU7IG1hdGNoID0gcmUuc2VhcmNoKHIi
+cmV0cnkgYWZ0ZXIgKFxkKykiLCBlcnJfZGVzYykKICAgICAgICAgICAgICAg
+IGlmIG1hdGNoOiByZXRyeV9hZnRlciA9IGludChtYXRjaC5ncm91cCgxKSkg
+KyAxIAogICAgICAgICAgICAgICAgbG9nZ2VyLndhcm5pbmcoZiJGbG9vZCBj
+b250cm9sLiBTbGVlcGluZyB7cmV0cnlfYWZ0ZXJ9cy4uLiIpCiAgICAgICAg
+ICAgICAgICB0aW1lLnNsZWVwKHJldHJ5X2FmdGVyKQogICAgICAgICAgICAg
+ICAgdHJ5OiAjIFJldHJ5IG9uY2UKICAgICAgICAgICAgICAgICAgICBpZiBi
+cm9hZGNhc3RfdGV4dDogYm90LnNlbmRfbWVzc2FnZSh1c2VyX2lkX2JjLCBi
+cm9hZGNhc3RfdGV4dCwgcGFyc2VfbW9kZT0nTWFya2Rvd24nKQogICAgICAg
+ICAgICAgICAgICAgIGVsaWYgcGhvdG9faWQ6IGJvdC5zZW5kX3Bob3RvKHVz
+ZXJfaWRfYmMsIHBob3RvX2lkLCBjYXB0aW9uPWNhcHRpb24sIHBhcnNlX21v
+ZGU9J01hcmtkb3duJyBpZiBjYXB0aW9uIGVsc2UgTm9uZSkKICAgICAgICAg
+ICAgICAgICAgICBlbGlmIHZpZGVvX2lkOiBib3Quc2VuZF92aWRlbyh1c2Vy
+X2lkX2JjLCB2aWRlb19pZCwgY2FwdGlvbj1jYXB0aW9uLCBwYXJzZV9tb2Rl
+PSdNYXJrZG93bicgaWYgY2FwdGlvbiBlbHNlIE5vbmUpCiAgICAgICAgICAg
+ICAgICAgICAgc2VudF9jb3VudCArPSAxCiAgICAgICAgICAgICAgICBleGNl
+cHQgRXhjZXB0aW9uIGFzIGVfcmV0cnk6IGxvZ2dlci5lcnJvcihmIkJyb2Fk
+Y2FzdCByZXRyeSBmYWlsZWQgdG8ge3VzZXJfaWRfYmN9OiB7ZV9yZXRyeX0i
+KTsgZmFpbGVkX2NvdW50ICs9MQogICAgICAgICAgICBlbHNlOiBsb2dnZXIu
+ZXJyb3IoZiJCcm9hZGNhc3QgZmFpbGVkIHRvIHt1c2VyX2lkX2JjfToge2V9
+Iik7IGZhaWxlZF9jb3VudCArPSAxCiAgICAgICAgZXhjZXB0IEV4Y2VwdGlv
+biBhcyBlOiBsb2dnZXIuZXJyb3IoZiJVbmV4cGVjdGVkIGVycm9yIGJyb2Fk
+Y2FzdGluZyB0byB7dXNlcl9pZF9iY306IHtlfSIpOyBmYWlsZWRfY291bnQg
+Kz0gMQoKICAgICAgICBpZiAoaSArIDEpICUgYmF0Y2hfc2l6ZSA9PSAwIGFu
+ZCBpIDwgdG90YWxfdXNlcnMgLSAxOgogICAgICAgICAgICBsb2dnZXIuaW5m
+byhmIkJyb2FkY2FzdCBiYXRjaCB7aS8vYmF0Y2hfc2l6ZSArIDF9IHNlbnQu
+IFNsZWVwaW5nIHtkZWxheV9iYXRjaGVzfXMuLi4iKQogICAgICAgICAgICB0
+aW1lLnNsZWVwKGRlbGF5X2JhdGNoZXMpCiAgICAgICAgZWxpZiBpICUgNSA9
+PSAwOiB0aW1lLnNsZWVwKDAuMikgCgogICAgZHVyYXRpb24gPSByb3VuZCh0
+aW1lLnRpbWUoKSAtIHN0YXJ0X2V4ZWNfdGltZSwgMikKICAgIHJlc3VsdF9t
+c2cgPSAoZiLwn5OiIEJyb2FkY2FzdCBDb21wbGV0ZSFcblxu4pyFIFNlbnQ6
+IHtzZW50X2NvdW50fVxu4p2MIEZhaWxlZDoge2ZhaWxlZF9jb3VudH1cbiIK
+ICAgICAgICAgICAgICAgICAgZiLwn5qrIEJsb2NrZWQvSW5hY3RpdmU6IHti
+bG9ja2VkX2NvdW50fVxu8J+RpSBUYXJnZXRzOiB7dG90YWxfdXNlcnN9XG7i
+j7HvuI8gRHVyYXRpb246IHtkdXJhdGlvbn1zIikKICAgIGxvZ2dlci5pbmZv
+KHJlc3VsdF9tc2cpCiAgICB0cnk6IGJvdC5zZW5kX21lc3NhZ2UoYWRtaW5f
+Y2hhdF9pZCwgcmVzdWx0X21zZykKICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMg
+ZTogbG9nZ2VyLmVycm9yKGYiRmFpbGVkIHRvIHNlbmQgYnJvYWRjYXN0IHJl
+c3VsdCB0byBhZG1pbiB7YWRtaW5fY2hhdF9pZH06IHtlfSIpCgpkZWYgYWRt
+aW5fcGFuZWxfY2FsbGJhY2soY2FsbCk6CiAgICBib3QuYW5zd2VyX2NhbGxi
+YWNrX3F1ZXJ5KGNhbGwuaWQpCiAgICB0cnk6CiAgICAgICAgYm90LmVkaXRf
+bWVzc2FnZV90ZXh0KCLwn5GRIEFkbWluIFBhbmVsXG5NYW5hZ2UgYWRtaW5z
+IChPd25lciBhY3Rpb25zIG1heSBiZSByZXN0cmljdGVkKS4iLAogICAgICAg
+ICAgICAgICAgICAgICAgICAgICAgICBjYWxsLm1lc3NhZ2UuY2hhdC5pZCwg
+Y2FsbC5tZXNzYWdlLm1lc3NhZ2VfaWQsIHJlcGx5X21hcmt1cD1jcmVhdGVf
+YWRtaW5fcGFuZWwoKSkKICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZTogbG9n
+Z2VyLmVycm9yKGYiRXJyb3Igc2hvd2luZyBhZG1pbiBwYW5lbDoge2V9IikK
+CmRlZiBhZGRfYWRtaW5faW5pdF9jYWxsYmFjayhjYWxsKToKICAgIGJvdC5h
+bnN3ZXJfY2FsbGJhY2tfcXVlcnkoY2FsbC5pZCkKICAgIG1zZyA9IGJvdC5z
+ZW5kX21lc3NhZ2UoY2FsbC5tZXNzYWdlLmNoYXQuaWQsICLwn5GRIEVudGVy
+IFVzZXIgSUQgdG8gcHJvbW90ZSB0byBBZG1pbi5cbi9jYW5jZWwgdG8gYWJv
+cnQuIikKICAgIGJvdC5yZWdpc3Rlcl9uZXh0X3N0ZXBfaGFuZGxlcihtc2cs
+IHByb2Nlc3NfYWRkX2FkbWluX2lkKQoKZGVmIHByb2Nlc3NfYWRkX2FkbWlu
+X2lkKG1lc3NhZ2UpOgogICAgb3duZXJfaWRfY2hlY2sgPSBtZXNzYWdlLmZy
+b21fdXNlci5pZCAKICAgIGlmIG93bmVyX2lkX2NoZWNrICE9IE9XTkVSX0lE
+OiBib3QucmVwbHlfdG8obWVzc2FnZSwgIuKaoO+4jyBPd25lciBvbmx5LiIp
+OyByZXR1cm4KICAgIGlmIG1lc3NhZ2UudGV4dC5sb3dlcigpID09ICcvY2Fu
+Y2VsJzogYm90LnJlcGx5X3RvKG1lc3NhZ2UsICJBZG1pbiBwcm9tb3Rpb24g
+Y2FuY2VsbGVkLiIpOyByZXR1cm4KICAgIHRyeToKICAgICAgICBuZXdfYWRt
+aW5faWQgPSBpbnQobWVzc2FnZS50ZXh0LnN0cmlwKCkpCiAgICAgICAgaWYg
+bmV3X2FkbWluX2lkIDw9IDA6IHJhaXNlIFZhbHVlRXJyb3IoIklEIG11c3Qg
+YmUgcG9zaXRpdmUiKQogICAgICAgIGlmIG5ld19hZG1pbl9pZCA9PSBPV05F
+Ul9JRDogYm90LnJlcGx5X3RvKG1lc3NhZ2UsICLimqDvuI8gT3duZXIgaXMg
+YWxyZWFkeSBPd25lci4iKTsgcmV0dXJuCiAgICAgICAgaWYgbmV3X2FkbWlu
+X2lkIGluIGFkbWluX2lkczogYm90LnJlcGx5X3RvKG1lc3NhZ2UsIGYi4pqg
+77iPIFVzZXIgYHtuZXdfYWRtaW5faWR9YCBhbHJlYWR5IEFkbWluLiIpOyBy
+ZXR1cm4KICAgICAgICBhZGRfYWRtaW5fZGIobmV3X2FkbWluX2lkKSAKICAg
+ICAgICBsb2dnZXIud2FybmluZyhmIkFkbWluIHtuZXdfYWRtaW5faWR9IGFk
+ZGVkIGJ5IE93bmVyIHtvd25lcl9pZF9jaGVja30uIikKICAgICAgICBib3Qu
+cmVwbHlfdG8obWVzc2FnZSwgZiLinIUgVXNlciBge25ld19hZG1pbl9pZH1g
+IHByb21vdGVkIHRvIEFkbWluLiIpCiAgICAgICAgdHJ5OiBib3Quc2VuZF9t
+ZXNzYWdlKG5ld19hZG1pbl9pZCwgIvCfjokgQ29uZ3JhdHMhIFlvdSBhcmUg
+bm93IGFuIEFkbWluLiIpCiAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbiBhcyBl
+OiBsb2dnZXIuZXJyb3IoZiJGYWlsZWQgdG8gbm90aWZ5IG5ldyBhZG1pbiB7
+bmV3X2FkbWluX2lkfToge2V9IikKICAgIGV4Y2VwdCBWYWx1ZUVycm9yOgog
+ICAgICAgIGJvdC5yZXBseV90byhtZXNzYWdlLCAi4pqg77iPIEludmFsaWQg
+SUQuIFNlbmQgbnVtZXJpY2FsIElEIG9yIC9jYW5jZWwuIikKICAgICAgICBt
+c2cgPSBib3Quc2VuZF9tZXNzYWdlKG1lc3NhZ2UuY2hhdC5pZCwgIvCfkZEg
+RW50ZXIgVXNlciBJRCB0byBwcm9tb3RlIG9yIC9jYW5jZWwuIikKICAgICAg
+ICBib3QucmVnaXN0ZXJfbmV4dF9zdGVwX2hhbmRsZXIobXNnLCBwcm9jZXNz
+X2FkZF9hZG1pbl9pZCkKICAgIGV4Y2VwdCBFeGNlcHRpb24gYXMgZTogbG9n
+Z2VyLmVycm9yKGYiRXJyb3IgcHJvY2Vzc2luZyBhZGQgYWRtaW46IHtlfSIs
+IGV4Y19pbmZvPVRydWUpOyBib3QucmVwbHlfdG8obWVzc2FnZSwgIkVycm9y
+LiIpCgpkZWYgcmVtb3ZlX2FkbWluX2luaXRfY2FsbGJhY2soY2FsbCk6CiAg
+ICBib3QuYW5zd2VyX2NhbGxiYWNrX3F1ZXJ5KGNhbGwuaWQpCiAgICBtc2cg
+PSBib3Quc2VuZF9tZXNzYWdlKGNhbGwubWVzc2FnZS5jaGF0LmlkLCAi8J+R
+kSBFbnRlciBVc2VyIElEIG9mIEFkbWluIHRvIHJlbW92ZS5cbi9jYW5jZWwg
+dG8gYWJvcnQuIikKICAgIGJvdC5yZWdpc3Rlcl9uZXh0X3N0ZXBfaGFuZGxl
+cihtc2csIHByb2Nlc3NfcmVtb3ZlX2FkbWluX2lkKQoKZGVmIHByb2Nlc3Nf
+cmVtb3ZlX2FkbWluX2lkKG1lc3NhZ2UpOgogICAgb3duZXJfaWRfY2hlY2sg
+PSBtZXNzYWdlLmZyb21fdXNlci5pZAogICAgaWYgb3duZXJfaWRfY2hlY2sg
+IT0gT1dORVJfSUQ6IGJvdC5yZXBseV90byhtZXNzYWdlLCAi4pqg77iPIE93
+bmVyIG9ubHkuIik7IHJldHVybgogICAgaWYgbWVzc2FnZS50ZXh0Lmxvd2Vy
+KCkgPT0gJy9jYW5jZWwnOiBib3QucmVwbHlfdG8obWVzc2FnZSwgIkFkbWlu
+IHJlbW92YWwgY2FuY2VsbGVkLiIpOyByZXR1cm4KICAgIHRyeToKICAgICAg
+ICBhZG1pbl9pZF9yZW1vdmUgPSBpbnQobWVzc2FnZS50ZXh0LnN0cmlwKCkp
+ICMgUmVuYW1lZAogICAgICAgIGlmIGFkbWluX2lkX3JlbW92ZSA8PSAwOiBy
+YWlzZSBWYWx1ZUVycm9yKCJJRCBtdXN0IGJlIHBvc2l0aXZlIikKICAgICAg
+ICBpZiBhZG1pbl9pZF9yZW1vdmUgPT0gT1dORVJfSUQ6IGJvdC5yZXBseV90
+byhtZXNzYWdlLCAi4pqg77iPIE93bmVyIGNhbm5vdCByZW1vdmUgc2VsZi4i
+KTsgcmV0dXJuCiAgICAgICAgaWYgYWRtaW5faWRfcmVtb3ZlIG5vdCBpbiBh
+ZG1pbl9pZHM6IGJvdC5yZXBseV90byhtZXNzYWdlLCBmIuKaoO+4jyBVc2Vy
+IGB7YWRtaW5faWRfcmVtb3ZlfWAgbm90IEFkbWluLiIpOyByZXR1cm4KICAg
+ICAgICBpZiByZW1vdmVfYWRtaW5fZGIoYWRtaW5faWRfcmVtb3ZlKTogCiAg
+ICAgICAgICAgIGxvZ2dlci53YXJuaW5nKGYiQWRtaW4ge2FkbWluX2lkX3Jl
+bW92ZX0gcmVtb3ZlZCBieSBPd25lciB7b3duZXJfaWRfY2hlY2t9LiIpCiAg
+ICAgICAgICAgIGJvdC5yZXBseV90byhtZXNzYWdlLCBmIuKchSBBZG1pbiBg
+e2FkbWluX2lkX3JlbW92ZX1gIHJlbW92ZWQuIikKICAgICAgICAgICAgdHJ5
+OiBib3Quc2VuZF9tZXNzYWdlKGFkbWluX2lkX3JlbW92ZSwgIuKEue+4jyBZ
+b3UgYXJlIG5vIGxvbmdlciBhbiBBZG1pbi4iKQogICAgICAgICAgICBleGNl
+cHQgRXhjZXB0aW9uIGFzIGU6IGxvZ2dlci5lcnJvcihmIkZhaWxlZCB0byBu
+b3RpZnkgcmVtb3ZlZCBhZG1pbiB7YWRtaW5faWRfcmVtb3ZlfToge2V9IikK
+ICAgICAgICBlbHNlOiBib3QucmVwbHlfdG8obWVzc2FnZSwgZiLinYwgRmFp
+bGVkIHRvIHJlbW92ZSBhZG1pbiBge2FkbWluX2lkX3JlbW92ZX1gLiBDaGVj
+ayBsb2dzLiIpCiAgICBleGNlcHQgVmFsdWVFcnJvcjoKICAgICAgICBib3Qu
+cmVwbHlfdG8obWVzc2FnZSwgIuKaoO+4jyBJbnZhbGlkIElELiBTZW5kIG51
+bWVyaWNhbCBJRCBvciAvY2FuY2VsLiIpCiAgICAgICAgbXNnID0gYm90LnNl
+bmRfbWVzc2FnZShtZXNzYWdlLmNoYXQuaWQsICLwn5GRIEVudGVyIEFkbWlu
+IElEIHRvIHJlbW92ZSBvciAvY2FuY2VsLiIpCiAgICAgICAgYm90LnJlZ2lz
+dGVyX25leHRfc3RlcF9oYW5kbGVyKG1zZywgcHJvY2Vzc19yZW1vdmVfYWRt
+aW5faWQpCiAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6IGxvZ2dlci5lcnJv
+cihmIkVycm9yIHByb2Nlc3NpbmcgcmVtb3ZlIGFkbWluOiB7ZX0iLCBleGNf
+aW5mbz1UcnVlKTsgYm90LnJlcGx5X3RvKG1lc3NhZ2UsICJFcnJvci4iKQoK
+ZGVmIGxpc3RfYWRtaW5zX2NhbGxiYWNrKGNhbGwpOgogICAgYm90LmFuc3dl
+cl9jYWxsYmFja19xdWVyeShjYWxsLmlkKQogICAgdHJ5OgogICAgICAgIGFk
+bWluX2xpc3Rfc3RyID0gIlxuIi5qb2luKGYiLSBge2FpZH1gIHsnKE93bmVy
+KScgaWYgYWlkID09IE9XTkVSX0lEIGVsc2UgJyd9IiBmb3IgYWlkIGluIHNv
+cnRlZChsaXN0KGFkbWluX2lkcykpKQogICAgICAgIGlmIG5vdCBhZG1pbl9s
+aXN0X3N0cjogYWRtaW5fbGlzdF9zdHIgPSAiKE5vIE93bmVyL0FkbWlucyBj
+b25maWd1cmVkISkiCiAgICAgICAgYm90LmVkaXRfbWVzc2FnZV90ZXh0KGYi
+8J+RkSBDdXJyZW50IEFkbWluczpcblxue2FkbWluX2xpc3Rfc3RyfSIsIGNh
+bGwubWVzc2FnZS5jaGF0LmlkLAogICAgICAgICAgICAgICAgICAgICAgICAg
+ICAgICBjYWxsLm1lc3NhZ2UubWVzc2FnZV9pZCwgcmVwbHlfbWFya3VwPWNy
+ZWF0ZV9hZG1pbl9wYW5lbCgpLCBwYXJzZV9tb2RlPSdNYXJrZG93bicpCiAg
+ICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6IGxvZ2dlci5lcnJvcihmIkVycm9y
+IGxpc3RpbmcgYWRtaW5zOiB7ZX0iKQoKZGVmIGFkZF9zdWJzY3JpcHRpb25f
+aW5pdF9jYWxsYmFjayhjYWxsKToKICAgIGJvdC5hbnN3ZXJfY2FsbGJhY2tf
+cXVlcnkoY2FsbC5pZCkKICAgIG1zZyA9IGJvdC5zZW5kX21lc3NhZ2UoY2Fs
+bC5tZXNzYWdlLmNoYXQuaWQsICLwn5KzIEVudGVyIFVzZXIgSUQgJiBkYXlz
+IChlLmcuLCBgMTIzNDU2NzggMzBgKS5cbi9jYW5jZWwgdG8gYWJvcnQuIikK
+ICAgIGJvdC5yZWdpc3Rlcl9uZXh0X3N0ZXBfaGFuZGxlcihtc2csIHByb2Nl
+c3NfYWRkX3N1YnNjcmlwdGlvbl9kZXRhaWxzKQoKZGVmIHByb2Nlc3NfYWRk
+X3N1YnNjcmlwdGlvbl9kZXRhaWxzKG1lc3NhZ2UpOgogICAgYWRtaW5faWRf
+Y2hlY2sgPSBtZXNzYWdlLmZyb21fdXNlci5pZCAKICAgIGlmIGFkbWluX2lk
+X2NoZWNrIG5vdCBpbiBhZG1pbl9pZHM6IGJvdC5yZXBseV90byhtZXNzYWdl
+LCAi4pqg77iPIE5vdCBhdXRob3JpemVkLiIpOyByZXR1cm4KICAgIGlmIG1l
+c3NhZ2UudGV4dC5sb3dlcigpID09ICcvY2FuY2VsJzogYm90LnJlcGx5X3Rv
+KG1lc3NhZ2UsICJTdWIgYWRkIGNhbmNlbGxlZC4iKTsgcmV0dXJuCiAgICB0
+cnk6CiAgICAgICAgcGFydHMgPSBtZXNzYWdlLnRleHQuc3BsaXQoKTsKICAg
+ICAgICBpZiBsZW4ocGFydHMpICE9IDI6IHJhaXNlIFZhbHVlRXJyb3IoIklu
+Y29ycmVjdCBmb3JtYXQiKQogICAgICAgIHN1Yl91c2VyX2lkID0gaW50KHBh
+cnRzWzBdLnN0cmlwKCkpOyBkYXlzID0gaW50KHBhcnRzWzFdLnN0cmlwKCkp
+CiAgICAgICAgaWYgc3ViX3VzZXJfaWQgPD0gMCBvciBkYXlzIDw9IDA6IHJh
+aXNlIFZhbHVlRXJyb3IoIlVzZXIgSUQvZGF5cyBtdXN0IGJlIHBvc2l0aXZl
+IikKCiAgICAgICAgY3VycmVudF9leHBpcnkgPSB1c2VyX3N1YnNjcmlwdGlv
+bnMuZ2V0KHN1Yl91c2VyX2lkLCB7fSkuZ2V0KCdleHBpcnknKQogICAgICAg
+IHN0YXJ0X2RhdGVfbmV3X3N1YiA9IGRhdGV0aW1lLm5vdygpICMgUmVuYW1l
+ZAogICAgICAgIGlmIGN1cnJlbnRfZXhwaXJ5IGFuZCBjdXJyZW50X2V4cGly
+eSA+IHN0YXJ0X2RhdGVfbmV3X3N1Yjogc3RhcnRfZGF0ZV9uZXdfc3ViID0g
+Y3VycmVudF9leHBpcnkKICAgICAgICBuZXdfZXhwaXJ5ID0gc3RhcnRfZGF0
+ZV9uZXdfc3ViICsgdGltZWRlbHRhKGRheXM9ZGF5cykKICAgICAgICBzYXZl
+X3N1YnNjcmlwdGlvbihzdWJfdXNlcl9pZCwgbmV3X2V4cGlyeSkKCiAgICAg
+ICAgbG9nZ2VyLmluZm8oZiJTdWIgZm9yIHtzdWJfdXNlcl9pZH0gYnkgYWRt
+aW4ge2FkbWluX2lkX2NoZWNrfS4gRXhwaXJ5OiB7bmV3X2V4cGlyeTolWS0l
+bS0lZH0iKQogICAgICAgIGJvdC5yZXBseV90byhtZXNzYWdlLCBmIuKchSBT
+dWIgZm9yIGB7c3ViX3VzZXJfaWR9YCBieSB7ZGF5c30gZGF5cy5cbk5ldyBl
+eHBpcnk6IHtuZXdfZXhwaXJ5OiVZLSVtLSVkfSIpCiAgICAgICAgdHJ5OiBi
+b3Quc2VuZF9tZXNzYWdlKHN1Yl91c2VyX2lkLCBmIvCfjokgU3ViIGFjdGl2
+YXRlZC9leHRlbmRlZCBieSB7ZGF5c30gZGF5cyEgRXhwaXJlczoge25ld19l
+eHBpcnk6JVktJW0tJWR9LiIpCiAgICAgICAgZXhjZXB0IEV4Y2VwdGlvbiBh
+cyBlOiBsb2dnZXIuZXJyb3IoZiJGYWlsZWQgdG8gbm90aWZ5IHtzdWJfdXNl
+cl9pZH0gb2YgbmV3IHN1Yjoge2V9IikKICAgIGV4Y2VwdCBWYWx1ZUVycm9y
+IGFzIGU6CiAgICAgICAgYm90LnJlcGx5X3RvKG1lc3NhZ2UsIGYi4pqg77iP
+IEludmFsaWQ6IHtlfS4gRm9ybWF0OiBgSUQgZGF5c2Agb3IgL2NhbmNlbC4i
+KQogICAgICAgIG1zZyA9IGJvdC5zZW5kX21lc3NhZ2UobWVzc2FnZS5jaGF0
+LmlkLCAi8J+SsyBFbnRlciBVc2VyIElEICYgZGF5cywgb3IgL2NhbmNlbC4i
+KQogICAgICAgIGJvdC5yZWdpc3Rlcl9uZXh0X3N0ZXBfaGFuZGxlcihtc2cs
+IHByb2Nlc3NfYWRkX3N1YnNjcmlwdGlvbl9kZXRhaWxzKQogICAgZXhjZXB0
+IEV4Y2VwdGlvbiBhcyBlOiBsb2dnZXIuZXJyb3IoZiJFcnJvciBwcm9jZXNz
+aW5nIGFkZCBzdWI6IHtlfSIsIGV4Y19pbmZvPVRydWUpOyBib3QucmVwbHlf
+dG8obWVzc2FnZSwgIkVycm9yLiIpCgpkZWYgcmVtb3ZlX3N1YnNjcmlwdGlv
+bl9pbml0X2NhbGxiYWNrKGNhbGwpOgogICAgYm90LmFuc3dlcl9jYWxsYmFj
+a19xdWVyeShjYWxsLmlkKQogICAgbXNnID0gYm90LnNlbmRfbWVzc2FnZShj
+YWxsLm1lc3NhZ2UuY2hhdC5pZCwgIvCfkrMgRW50ZXIgVXNlciBJRCB0byBy
+ZW1vdmUgc3ViLlxuL2NhbmNlbCB0byBhYm9ydC4iKQogICAgYm90LnJlZ2lz
+dGVyX25leHRfc3RlcF9oYW5kbGVyKG1zZywgcHJvY2Vzc19yZW1vdmVfc3Vi
+c2NyaXB0aW9uX2lkKQoKZGVmIHByb2Nlc3NfcmVtb3ZlX3N1YnNjcmlwdGlv
+bl9pZChtZXNzYWdlKToKICAgIGFkbWluX2lkX2NoZWNrID0gbWVzc2FnZS5m
+cm9tX3VzZXIuaWQKICAgIGlmIGFkbWluX2lkX2NoZWNrIG5vdCBpbiBhZG1p
+bl9pZHM6IGJvdC5yZXBseV90byhtZXNzYWdlLCAi4pqg77iPIE5vdCBhdXRo
+b3JpemVkLiIpOyByZXR1cm4KICAgIGlmIG1lc3NhZ2UudGV4dC5sb3dlcigp
+ID09ICcvY2FuY2VsJzogYm90LnJlcGx5X3RvKG1lc3NhZ2UsICJTdWIgcmVt
+b3ZhbCBjYW5jZWxsZWQuIik7IHJldHVybgogICAgdHJ5OgogICAgICAgIHN1
+Yl91c2VyX2lkX3JlbW92ZSA9IGludChtZXNzYWdlLnRleHQuc3RyaXAoKSkg
+IyBSZW5hbWVkCiAgICAgICAgaWYgc3ViX3VzZXJfaWRfcmVtb3ZlIDw9IDA6
+IHJhaXNlIFZhbHVlRXJyb3IoIklEIG11c3QgYmUgcG9zaXRpdmUiKQogICAg
+ICAgIGlmIHN1Yl91c2VyX2lkX3JlbW92ZSBub3QgaW4gdXNlcl9zdWJzY3Jp
+cHRpb25zOgogICAgICAgICAgICBib3QucmVwbHlfdG8obWVzc2FnZSwgZiLi
+mqDvuI8gVXNlciBge3N1Yl91c2VyX2lkX3JlbW92ZX1gIG5vIGFjdGl2ZSBz
+dWIgaW4gbWVtb3J5LiIpOyByZXR1cm4KICAgICAgICByZW1vdmVfc3Vic2Ny
+aXB0aW9uX2RiKHN1Yl91c2VyX2lkX3JlbW92ZSkgCiAgICAgICAgbG9nZ2Vy
+Lndhcm5pbmcoZiJTdWIgcmVtb3ZlZCBmb3Ige3N1Yl91c2VyX2lkX3JlbW92
+ZX0gYnkgYWRtaW4ge2FkbWluX2lkX2NoZWNrfS4iKQogICAgICAgIGJvdC5y
+ZXBseV90byhtZXNzYWdlLCBmIuKchSBTdWIgZm9yIGB7c3ViX3VzZXJfaWRf
+cmVtb3ZlfWAgcmVtb3ZlZC4iKQogICAgICAgIHRyeTogYm90LnNlbmRfbWVz
+c2FnZShzdWJfdXNlcl9pZF9yZW1vdmUsICLihLnvuI8gWW91ciBzdWJzY3Jp
+cHRpb24gcmVtb3ZlZCBieSBhZG1pbi4iKQogICAgICAgIGV4Y2VwdCBFeGNl
+cHRpb24gYXMgZTogbG9nZ2VyLmVycm9yKGYiRmFpbGVkIHRvIG5vdGlmeSB7
+c3ViX3VzZXJfaWRfcmVtb3ZlfSBvZiBzdWIgcmVtb3ZhbDoge2V9IikKICAg
+IGV4Y2VwdCBWYWx1ZUVycm9yOgogICAgICAgIGJvdC5yZXBseV90byhtZXNz
+YWdlLCAi4pqg77iPIEludmFsaWQgSUQuIFNlbmQgbnVtZXJpY2FsIElEIG9y
+IC9jYW5jZWwuIikKICAgICAgICBtc2cgPSBib3Quc2VuZF9tZXNzYWdlKG1l
+c3NhZ2UuY2hhdC5pZCwgIvCfkrMgRW50ZXIgVXNlciBJRCB0byByZW1vdmUg
+c3ViIGZyb20sIG9yIC9jYW5jZWwuIikKICAgICAgICBib3QucmVnaXN0ZXJf
+bmV4dF9zdGVwX2hhbmRsZXIobXNnLCBwcm9jZXNzX3JlbW92ZV9zdWJzY3Jp
+cHRpb25faWQpCiAgICBleGNlcHQgRXhjZXB0aW9uIGFzIGU6IGxvZ2dlci5l
+cnJvcihmIkVycm9yIHByb2Nlc3NpbmcgcmVtb3ZlIHN1Yjoge2V9IiwgZXhj
+X2luZm89VHJ1ZSk7IGJvdC5yZXBseV90byhtZXNzYWdlLCAiRXJyb3IuIikK
+CmRlZiBjaGVja19zdWJzY3JpcHRpb25faW5pdF9jYWxsYmFjayhjYWxsKToK
+ICAgIGJvdC5hbnN3ZXJfY2FsbGJhY2tfcXVlcnkoY2FsbC5pZCkKICAgIG1z
+ZyA9IGJvdC5zZW5kX21lc3NhZ2UoY2FsbC5tZXNzYWdlLmNoYXQuaWQsICLw
+n5KzIEVudGVyIFVzZXIgSUQgdG8gY2hlY2sgc3ViLlxuL2NhbmNlbCB0byBh
+Ym9ydC4iKQogICAgYm90LnJlZ2lzdGVyX25leHRfc3RlcF9oYW5kbGVyKG1z
+ZywgcHJvY2Vzc19jaGVja19zdWJzY3JpcHRpb25faWQpCgpkZWYgcHJvY2Vz
+c19jaGVja19zdWJzY3JpcHRpb25faWQobWVzc2FnZSk6CiAgICBhZG1pbl9p
+ZF9jaGVjayA9IG1lc3NhZ2UuZnJvbV91c2VyLmlkCiAgICBpZiBhZG1pbl9p
+ZF9jaGVjayBub3QgaW4gYWRtaW5faWRzOiBib3QucmVwbHlfdG8obWVzc2Fn
+ZSwgIuKaoO+4jyBOb3QgYXV0aG9yaXplZC4iKTsgcmV0dXJuCiAgICBpZiBt
+ZXNzYWdlLnRleHQubG93ZXIoKSA9PSAnL2NhbmNlbCc6IGJvdC5yZXBseV90
+byhtZXNzYWdlLCAiU3ViIGNoZWNrIGNhbmNlbGxlZC4iKTsgcmV0dXJuCiAg
+ICB0cnk6CiAgICAgICAgc3ViX3VzZXJfaWRfY2hlY2sgPSBpbnQobWVzc2Fn
+ZS50ZXh0LnN0cmlwKCkpICMgUmVuYW1lZAogICAgICAgIGlmIHN1Yl91c2Vy
+X2lkX2NoZWNrIDw9IDA6IHJhaXNlIFZhbHVlRXJyb3IoIklEIG11c3QgYmUg
+cG9zaXRpdmUiKQogICAgICAgIGlmIHN1Yl91c2VyX2lkX2NoZWNrIGluIHVz
+ZXJfc3Vic2NyaXB0aW9uczoKICAgICAgICAgICAgZXhwaXJ5X2R0ID0gdXNl
+cl9zdWJzY3JpcHRpb25zW3N1Yl91c2VyX2lkX2NoZWNrXS5nZXQoJ2V4cGly
+eScpCiAgICAgICAgICAgIGlmIGV4cGlyeV9kdDoKICAgICAgICAgICAgICAg
+IGlmIGV4cGlyeV9kdCA+IGRhdGV0aW1lLm5vdygpOgogICAgICAgICAgICAg
+ICAgICAgIGRheXNfbGVmdCA9IChleHBpcnlfZHQgLSBkYXRldGltZS5ub3co
+KSkuZGF5cwogICAgICAgICAgICAgICAgICAgIGJvdC5yZXBseV90byhtZXNz
+YWdlLCBmIuKchSBVc2VyIGB7c3ViX3VzZXJfaWRfY2hlY2t9YCBhY3RpdmUg
+c3ViLlxuRXhwaXJlczoge2V4cGlyeV9kdDolWS0lbS0lZCAlSDolTTolU30g
+KHtkYXlzX2xlZnR9IGRheXMgbGVmdCkuIikKICAgICAgICAgICAgICAgIGVs
+c2U6CiAgICAgICAgICAgICAgICAgICAgYm90LnJlcGx5X3RvKG1lc3NhZ2Us
+IGYi4pqg77iPIFVzZXIgYHtzdWJfdXNlcl9pZF9jaGVja31gIGV4cGlyZWQg
+c3ViIChPbjoge2V4cGlyeV9kdDolWS0lbS0lZCAlSDolTTolU30pLiIpCiAg
+ICAgICAgICAgICAgICAgICAgcmVtb3ZlX3N1YnNjcmlwdGlvbl9kYihzdWJf
+dXNlcl9pZF9jaGVjaykgIyBDbGVhbiB1cAogICAgICAgICAgICBlbHNlOiBi
+b3QucmVwbHlfdG8obWVzc2FnZSwgZiLimqDvuI8gVXNlciBge3N1Yl91c2Vy
+X2lkX2NoZWNrfWAgaW4gc3ViIGxpc3QsIGJ1dCBleHBpcnkgbWlzc2luZy4g
+UmUtYWRkIGlmIG5lZWRlZC4iKQogICAgICAgIGVsc2U6IGJvdC5yZXBseV90
+byhtZXNzYWdlLCBmIuKEue+4jyBVc2VyIGB7c3ViX3VzZXJfaWRfY2hlY2t9
+YCBubyBhY3RpdmUgc3ViIHJlY29yZC4iKQogICAgZXhjZXB0IFZhbHVlRXJy
+b3I6CiAgICAgICAgYm90LnJlcGx5X3RvKG1lc3NhZ2UsICLimqDvuI8gSW52
+YWxpZCBJRC4gU2VuZCBudW1lcmljYWwgSUQgb3IgL2NhbmNlbC4iKQogICAg
+ICAgIG1zZyA9IGJvdC5zZW5kX21lc3NhZ2UobWVzc2FnZS5jaGF0LmlkLCAi
+8J+SsyBFbnRlciBVc2VyIElEIHRvIGNoZWNrLCBvciAvY2FuY2VsLiIpCiAg
+ICAgICAgYm90LnJlZ2lzdGVyX25leHRfc3RlcF9oYW5kbGVyKG1zZywgcHJv
+Y2Vzc19jaGVja19zdWJzY3JpcHRpb25faWQpCiAgICBleGNlcHQgRXhjZXB0
+aW9uIGFzIGU6IGxvZ2dlci5lcnJvcihmIkVycm9yIHByb2Nlc3NpbmcgY2hl
+Y2sgc3ViOiB7ZX0iLCBleGNfaW5mbz1UcnVlKTsgYm90LnJlcGx5X3RvKG1l
+c3NhZ2UsICJFcnJvci4iKQoKIyAtLS0gRW5kIENhbGxiYWNrIFF1ZXJ5IEhh
+bmRsZXJzIC0tLQoKIyAtLS0gQ2xlYW51cCBGdW5jdGlvbiAtLS0KZGVmIGNs
+ZWFudXAoKToKICAgIGxvZ2dlci53YXJuaW5nKCJTaHV0ZG93bi4gQ2xlYW5p
+bmcgdXAgcHJvY2Vzc2VzLi4uIikKICAgIHNjcmlwdF9rZXlzX3RvX3N0b3Ag
+PSBsaXN0KGJvdF9zY3JpcHRzLmtleXMoKSkgCiAgICBpZiBub3Qgc2NyaXB0
+X2tleXNfdG9fc3RvcDogbG9nZ2VyLmluZm8oIk5vIHNjcmlwdHMgcnVubmlu
+Zy4gRXhpdGluZy4iKTsgcmV0dXJuCiAgICBsb2dnZXIuaW5mbyhmIlN0b3Bw
+aW5nIHtsZW4oc2NyaXB0X2tleXNfdG9fc3RvcCl9IHNjcmlwdHMuLi4iKQog
+ICAgZm9yIGtleSBpbiBzY3JpcHRfa2V5c190b19zdG9wOgogICAgICAgIGlm
+IGtleSBpbiBib3Rfc2NyaXB0czogbG9nZ2VyLmluZm8oZiJTdG9wcGluZzog
+e2tleX0iKTsga2lsbF9wcm9jZXNzX3RyZWUoYm90X3NjcmlwdHNba2V5XSkK
+ICAgICAgICBlbHNlOiBsb2dnZXIuaW5mbyhmIlNjcmlwdCB7a2V5fSBhbHJl
+YWR5IHJlbW92ZWQuIikKICAgIGxvZ2dlci53YXJuaW5nKCJDbGVhbnVwIGZp
+bmlzaGVkLiIpCmF0ZXhpdC5yZWdpc3RlcihjbGVhbnVwKQoKIyAtLS0gTWFp
+biBFeGVjdXRpb24gLS0tCmlmIF9fbmFtZV9fID09ICdfX21haW5fXyc6CiAg
+ICBsb2dnZXIuaW5mbygiPSIqNDAgKyAiXG7wn6SWIEJvdCBTdGFydGluZyBV
+cC4uLlxuIiArIGYi8J+QjSBQeXRob246IHtzeXMudmVyc2lvbi5zcGxpdCgp
+WzBdfVxuIiArCiAgICAgICAgICAgICAgICBmIvCflKcgQmFzZSBEaXI6IHtC
+QVNFX0RJUn1cbvCfk4EgVXBsb2FkIERpcjoge1VQTE9BRF9CT1RTX0RJUn1c
+biIgKwogICAgICAgICAgICAgICAgZiLwn5OKIERhdGEgRGlyOiB7SVJPVEVD
+SF9ESVJ9XG7wn5SRIE93bmVyIElEOiB7ODI1MjQ0OTkzMn1cbvCfm6HvuI8g
+QWRtaW5zOiB7YWRtaW5faWRzfVxuIiArICI9Iio0MCkKICAgIGtlZXBfYWxp
+dmUoKQogICAgbG9nZ2VyLmluZm8oIvCfmoAgU3RhcnRpbmcgcG9sbGluZy4u
+LiIpCiAgICB3aGlsZSBUcnVlOgogICAgICAgIHRyeToKICAgICAgICAgICAg
+Ym90LmluZmluaXR5X3BvbGxpbmcobG9nZ2VyX2xldmVsPWxvZ2dpbmcuSU5G
+TywgdGltZW91dD02MCwgbG9uZ19wb2xsaW5nX3RpbWVvdXQ9MzApCiAgICAg
+ICAgZXhjZXB0IHJlcXVlc3RzLmV4Y2VwdGlvbnMuUmVhZFRpbWVvdXQ6IGxv
+Z2dlci53YXJuaW5nKCJQb2xsaW5nIFJlYWRUaW1lb3V0LiBSZXN0YXJ0aW5n
+IGluIDVzLi4uIik7IHRpbWUuc2xlZXAoNSkKICAgICAgICBleGNlcHQgcmVx
+dWVzdHMuZXhjZXB0aW9ucy5Db25uZWN0aW9uRXJyb3IgYXMgY2U6IGxvZ2dl
+ci5lcnJvcihmIlBvbGxpbmcgQ29ubmVjdGlvbkVycm9yOiB7Y2V9LiBSZXRy
+eWluZyBpbiAxNXMuLi4iKTsgdGltZS5zbGVlcCgxNSkKICAgICAgICBleGNl
+cHQgRXhjZXB0aW9uIGFzIGU6CiAgICAgICAgICAgIGxvZ2dlci5jcml0aWNh
+bChmIvCfkqUgVW5yZWNvdmVyYWJsZSBwb2xsaW5nIGVycm9yOiB7ZX0iLCBl
+eGNfaW5mbz1UcnVlKQogICAgICAgICAgICBsb2dnZXIuaW5mbygiUmVzdGFy
+dGluZyBwb2xsaW5nIGluIDMwcyBkdWUgdG8gY3JpdGljYWwgZXJyb3IuLi4i
+KTsgdGltZS5zbGVlcCgzMCkKICAgICAgICBmaW5hbGx5OiBsb2dnZXIud2Fy
+bmluZygiUG9sbGluZyBhdHRlbXB0IGZpbmlzaGVkLiBXaWxsIHJlc3RhcnQg
+aWYgaW4gbG9vcC4iKTsgdGltZS5zbGVlcCgxKQ==
